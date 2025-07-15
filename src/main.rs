@@ -2,7 +2,6 @@ use tokio_udev::{AsyncMonitorSocket, MonitorBuilder};
 use tokio_stream::StreamExt;
 use std::process::Command;
 use std::fs;
-use std::path::Path;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,24 +32,44 @@ fn handle_event(event: tokio_udev::Event) -> Result<(), Box<dyn std::error::Erro
     // Traitement spécifique selon le type d'événement
     match event.event_type() {
         tokio_udev::EventType::Add => {
-            let devnode = event.devnode().map(|d| d.display().to_string());
-            if let Some(node) = devnode {
+            if let Some(devnode) = event.devnode(){
+                let path = devnode.display().to_string();
                 // Vérifier que c'est bien un périphérique USB
-                if let Ok(Some(parent)) = event.parent_with_subsystem_devtype("usb", "usb_device") {
-                    let product = parent.attribute_value("product")
-                        .map(|v| v.to_str().unwrap_or("Inconnu"))
-                        .unwrap_or("Inconnu");
-
-                    if node.chars().last().map_or(false, |c| c.is_numeric()) {
-                        println!("🔌 Partition détectée: {} ({})", node, product);
-                        mount_partition_for_usb_agent(&node)?;
-                    } else {
-                    println!("🔍 Disque détecté (non monté): {}", node);
+                if event.parent_with_subsystem_devtype("usb", "usb_device")?.is_some() {
+                    
+                    // Vérifier que c'est bien une partition (devtype == "partition")
+                    if let Some(devtype) = event.device().devtype() {
+                        if devtype == "partition" {
+                            println!("🔌 Partition détectée: {}", path);
+                            if let Err(e) = mount_partition(&path) {
+                                eprintln!("Erreur montage: {}", e);
+                            }
+                        } else if devtype == "disk" {
+                            println!("🔍 Disque détecté: {}", path);
+                        }
                     }
                 }
             }
         },
-        tokio_udev::EventType::Remove => println!("Périphérique retiré"),
+        tokio_udev::EventType::Remove => {
+            if let Some(devnode) = event.devnode() {
+                let path = devnode.display().to_string();
+                // Vérifier que c'est bien un périphérique USB
+                if event.parent_with_subsystem_devtype("usb", "usb_device")?.is_some() {
+                    // Vérifier que c'est bien une partition (devtype == "partition")
+                    if let Some(devtype) = event.device().devtype() {
+                        if devtype == "partition" {
+                            println!("🔌 Partition retirée: {}", path);
+                            if let Err(e) = unmount_partition(&path) {
+                                eprintln!("Erreur démontage: {}", e);
+                            }
+                        } else if devtype == "disk" {
+                            println!("🔍 Disque retiré: {}", path);
+                        }
+                    }
+                }
+            }
+        },
         _ => {}
     }
 
@@ -72,13 +91,13 @@ fn ensure_service_account_exists() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 
-fn get_fs_type(devnode: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn get_fs_type(path: &str) -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("blkid")
-        .arg(devnode)
+        .arg(path)
         .output()?;
 
     if !output.status.success() {
-        return Err(format!("Erreur blkid sur {}", devnode).into());
+        return Err(format!("Erreur blkid sur {}", path).into());
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -93,13 +112,13 @@ fn get_fs_type(devnode: &str) -> Result<String, Box<dyn std::error::Error>> {
 
 
 
-fn mount_partition_for_usb_agent(devnode: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let device_name = devnode.split('/').last().unwrap_or("unk");
-    let mount_point = format!("/mnt/usb-agent/{}", device_name);
-    fs::create_dir_all(&mount_point)?;
+fn mount_partition(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let device_name = path.split('/').last().unwrap_or("unk");
+    let full_path = format!("/mnt/usb-agent/{}", device_name);
+    fs::create_dir_all(&full_path)?;
 
-    let fs_type = get_fs_type(devnode)?;
-    println!("📦 Système de fichiers détecté pour {}: {}", devnode, fs_type);
+    let fs_type = get_fs_type(path)?;
+    println!("📦 Système de fichiers détecté pour {}: {}", path, fs_type);
 
     // Type de montage
     let mut mount_cmd = Command::new("mount");
@@ -116,35 +135,67 @@ fn mount_partition_for_usb_agent(devnode: &str) -> Result<(), Box<dyn std::error
             .to_string();
 
         let options = format!("uid={},gid={},umask=077", uid, gid);
-        mount_cmd.args(&["-o", &options, devnode, &mount_point]);
+        mount_cmd.args(&["-o", &options, path, &full_path]);
     } else {
         // Ext, XFS, Btrfs → montage standard
-        mount_cmd.args(&[devnode, &mount_point]);
+        mount_cmd.args(&[path, &full_path]);
     }
 
     let status = mount_cmd.status()?;
     if !status.success() {
-        return Err(format!("Échec du montage de {}", devnode).into());
+        return Err(format!("Échec du montage de {}", path).into());
     }
 
     // Post-montage : chmod/chown pour systèmes de fichiers POSIX
     if !["vfat", "exfat", "ntfs"].contains(&fs_type.as_str()) {
         let chown = Command::new("chown")
-            .args(&["usb-agent:usb-agent", &mount_point])
+            .args(&["usb-agent:usb-agent", &full_path])
             .status()?;
         if !chown.success() {
-            return Err(format!("Échec du chown sur {}", mount_point).into());
+            return Err(format!("Échec du chown sur {}", full_path).into());
         }
 
         let chmod = Command::new("chmod")
-            .args(&["700", &mount_point])
+            .args(&["700", &full_path])
             .status()?;
         if !chmod.success() {
-            return Err(format!("Échec du chmod sur {}", mount_point).into());
+            return Err(format!("Échec du chmod sur {}", full_path).into());
         }
     }
 
-    println!("✅ Partition {} montée sur {}", devnode, mount_point);
+    println!("✅ Partition {} montée sur {}", path, full_path);
     Ok(())
 }
 
+fn unmount_partition(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let device_name = path.split('/').last().unwrap_or("unk");
+    let full_path = format!("/mnt/usb-agent/{}", device_name);
+
+    // Vérifie si le point est monté
+    let status = Command::new("mountpoint")
+        .arg("-q")
+        .arg(&full_path)
+        .status()?;
+
+    if !status.success() {
+        println!("⚠️ {} n'est pas un point de montage actif. Ignoré.", full_path);
+        return Ok(());
+    }
+
+    // Démontage
+    let umount_status = Command::new("umount")
+        .arg(&full_path)
+        .status()?;
+
+    if !umount_status.success() {
+        return Err(format!("❌ Échec du démontage de {}", full_path).into());
+    }
+
+    // Supprime le dossier s'il existe
+    if let Err(e) = fs::remove_dir_all(&full_path) {
+        eprintln!("⚠️ Dossier non supprimé ({}): {}", full_path, e);
+    }
+
+    println!("📤 Démontage réussi de {}", full_path);
+    Ok(())
+}
