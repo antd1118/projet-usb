@@ -11,3 +11,4 @@ tokio-udev = "0.9.1"
 tokio-stream = "0.1.17"
 users = "0.11"
 nix = { version = "0.30.1", features = ["sched", "mount", "fs", "user"] }
+caps = "0.5.5"
