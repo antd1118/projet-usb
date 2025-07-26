@@ -327,8 +327,10 @@ fn spawn_worker_for_partition(device_path: &str) -> Result<(), Box<dyn std::erro
 
             println!("✅ [Worker] Partition {} bind-mountée dans namespace isolé !", device_path);
 
-            // 12. Simulation
-            thread::sleep(Duration::from_secs(30));
+            // 12. Fonction de gestion de la partition
+            if let Err(e) = send_files(&mount_path, device_name) {
+                eprintln!("❌ send_files: {}", e);  // visible dans journalctl
+            }
 
             umount2(&mount_path, MntFlags::MNT_DETACH).ok();
             fs::remove_dir_all(&mount_path).ok();
@@ -337,4 +339,80 @@ fn spawn_worker_for_partition(device_path: &str) -> Result<(), Box<dyn std::erro
             std::process::exit(0);
         }
     }
+}
+
+// ─── Cargo.toml ──────────────────────────────────────────────────────
+// [dependencies]
+// uuid      = { version = "1", features = ["v4"] }
+// walkdir   = "2.4"
+// serde     = { version = "1.0", features = ["derive"] }
+// serde_json= "1.0"
+// ─────────────────────────────────────────────────────────────────────
+
+use serde::{Deserialize, Serialize};
+use std::io::{Write, Read};
+use std::net::TcpStream;
+use uuid::Uuid;
+use walkdir::WalkDir;
+
+// ─── mêmes structures que le backend ─────────────────────────────────
+#[derive(Debug, Serialize, Deserialize)]
+struct Manifeste {
+    device_id: String,
+    session_id: String,
+    files: Vec<FileEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FileEntry {
+    path: String,
+    size: u64,
+}
+
+/// Envoie tous les fichiers présents sous `mount_root` au backend.
+/// `device_id` → ex. "sda1"
+fn send_files(mount_root: &Path, device_id: &str) -> anyhow::Result<()> {
+    // 1. Balayage récursif pour constituer le manifeste
+    let mut entries = Vec::<FileEntry>::new();
+
+    for entry in WalkDir::new(mount_root).into_iter().filter_map(Result::ok) {
+        if entry.file_type().is_file() {
+            let rel = entry.path().strip_prefix(mount_root)?;      // chemin relatif
+            let size = entry.metadata()?.len();
+            entries.push(FileEntry {
+                path: rel.to_string_lossy().to_string(),
+                size,
+            });
+        }
+    }
+
+    let manifeste = Manifeste {
+        device_id: device_id.to_string(),
+        session_id: Uuid::new_v4().to_string(),
+        files: entries,
+    };
+
+    let manifeste_bytes = serde_json::to_vec(&manifeste)?;
+
+    // 2. Connexion TCP au backend
+    let mut stream = TcpStream::connect("127.0.0.1:7878")?;
+
+    // 3. Envoyer la taille du manifeste (u32 big-endian) PUIS le manifeste
+    let len = (manifeste_bytes.len() as u32).to_be_bytes();
+    stream.write_all(&len)?;
+    stream.write_all(&manifeste_bytes)?;
+
+    // 4. Envoyer chaque fichier, dans l'ordre du manifeste
+    let mut buf = [0u8; 8192];
+    for file in &manifeste.files {
+        let mut f = std::fs::File::open(mount_root.join(&file.path))?;
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 { break; }
+            stream.write_all(&buf[..n])?;
+        }
+    }
+
+    println!("🚚 Tous les fichiers envoyés pour {}", device_id);
+    Ok(())
 }

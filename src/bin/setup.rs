@@ -2,7 +2,10 @@ use std::fs;
 use std::io::{self,Write};
 use std::process::{Command, Stdio};
 use std::path::{Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+    println!("Configuration de l'agent RustyKey. L'application restera active même aprés redémarage. Reexcutez le setup pour la désinstaller.");
 
     let user_exists = Command::new("id")
         .arg("usb-agent")
@@ -77,17 +80,12 @@ fn create_user() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             let shell = fields[6].trim();
             let uid: u32 = fields[2].parse()?;
-            let home_dir = fields[5].trim();
             if shell != "/usr/sbin/nologin" {
                 println!("⚠️ L'utilisateur usb-agent doit avoir un shell bloqué (/usr/sbin/nologin)");
                 requires_recreate = true;
             }
             if uid >= 1000 {
                 println!("⚠️ L'utilisateur usb-agent doit être un compte système (UID < 1000)");
-                requires_recreate = true;
-            }
-            if home_dir != "/nonexistent" {
-                println!("⚠️ L'utilisateur usb-agent ne doit pas avoir de répertoire personnel (/nonexistent)");
                 requires_recreate = true;
             }
         }
@@ -157,7 +155,7 @@ fn disable_automount() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let trigger = Command::new("udevadm")
-            .args(&["trigger", "--action=add"])
+            .args(&["trigger", "--action=add","--subsystem-match=block", "--property-match=SUBSYSTEMS=usb"])
             .status()?;
         if !trigger.success() {
             return Err("❌ Échec lors du déclenchement des règles udev.".into());
@@ -185,29 +183,27 @@ fn create_service() -> Result<(), Box<dyn std::error::Error>> {
         [Service]
         User=usb-agent
         ExecStart=/usr/local/bin/rustykey-agent
-        ReadOnlyPaths=/
-        ReadWritePaths=/mnt/usb-agent
-
+        
         # Isolation et sécurité maximale
         NoNewPrivileges=true
         PrivateTmp=true
         ProtectSystem=strict
         ProtectHome=true
+        ReadOnlyPaths=/
         ProtectKernelModules=true
         ProtectKernelTunables=true
         ProtectControlGroups=true
         ProtectProc=invisible
-        PrivateDevices=true
         MemoryDenyWriteExecute=true
         RestrictSUIDSGID=true
         RestrictRealtime=true
         LockPersonality=true
-        SystemCallFilter=~@reboot @shutdown
+        SystemCallFilter=~@reboot
         SystemCallArchitectures=native
 
         # Capability pour autoriser le montage/démontage
-        # CapabilityBoundingSet=CAP_SYS_ADMIN
-        # AmbientCapabilities=CAP_SYS_ADMIN
+        CapabilityBoundingSet=CAP_SYS_ADMIN
+        AmbientCapabilities=CAP_SYS_ADMIN
 
         # Redémarrage automatique en cas de problème
         Restart=on-failure
@@ -253,7 +249,7 @@ fn disable_app() -> Result<(), Box<dyn std::error::Error>> {
     // supprimer règle udev
     fs::remove_file("/etc/udev/rules.d/99-rustykey.rules")?;
     let _ = Command::new("udevadm").args(&["control", "--reload-rules"]).status();
-    let _ = Command::new("udevadm").args(&["trigger", "--action=remove"]).status();
+    let _ = Command::new("udevadm").args(&["trigger", "--action=remove","--subsystem-match=block", "--property-match=SUBSYSTEMS=usb"]).status();
 
     // supprimer utilisateur usb-agent
     let _ = Command::new("userdel").arg("usb-agent").status();
@@ -264,7 +260,7 @@ fn disable_app() -> Result<(), Box<dyn std::error::Error>> {
 // Fonction pour trouver le chemin de l'executable agent et créer un lien symbolique dans /usr/local/bin pour faciliter l'exécution avec systemd
 
 fn set_agent_path() -> Result<(), Box<dyn std::error::Error>> {
-    let symlink_path = "/usr/local/bin/rustykey-agent";
+    let prog_path = "/usr/local/bin/rustykey-agent";
 
     // auto-détection dans le même dossier que le setup
     let setup_dir = std::env::current_exe()?.parent().unwrap().to_path_buf();
@@ -286,11 +282,11 @@ fn set_agent_path() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // création du lien symbolique
-    if Path::new(symlink_path).exists() {
-        fs::remove_file(symlink_path)?;
+    if Path::new(prog_path).exists() {
+        fs::remove_file(prog_path)?;
     }
-    std::os::unix::fs::symlink(&agent_path, symlink_path)?;
-
-    println!("✅ Lien symbolique créé / ne pas supprimer : {symlink_path} => {:?}", agent_path);
+    fs::copy(&agent_path, prog_path)?;
+    fs::set_permissions(prog_path, fs::Permissions::from_mode(0o755))?;
+    println!("✅ Programme copié dans {:?}", prog_path);
     Ok(())
 }
