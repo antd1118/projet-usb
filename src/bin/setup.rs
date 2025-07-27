@@ -192,13 +192,14 @@ fn create_service() -> Result<(), Box<dyn std::error::Error>> {
         ReadOnlyPaths=/
         ProtectKernelModules=true
         ProtectKernelTunables=true
+        ProtectKernelLogs=true
         ProtectControlGroups=true
         ProtectProc=invisible
         MemoryDenyWriteExecute=true
         RestrictSUIDSGID=true
         RestrictRealtime=true
         LockPersonality=true
-        SystemCallFilter=~@reboot
+        SystemCallFilter=~@reboot ~@resources ~@module ~@keyring ~@debug ~@swap
         SystemCallArchitectures=native
 
         # Capability pour autoriser le montage/démontage

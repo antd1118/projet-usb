@@ -1,21 +1,16 @@
 use tokio_udev::{AsyncMonitorSocket, MonitorBuilder, Enumerator};
 use tokio_stream::StreamExt;
-use std::process::{Command, exit};
+use std::process::{Command};
 use std::path::{Path, PathBuf};
-use std::collections::HashSet;
 use nix::sched::{unshare, CloneFlags};
 use nix::mount::{mount, umount2, MsFlags, MntFlags};
 use nix::unistd::{fork, ForkResult, pivot_root, chdir};
 use std::fs::{self, create_dir_all, remove_dir_all, write, File};
-use std::os::unix::prelude::PermissionsExt;
-use std::thread;
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use std::io::{Write, Read, BufReader, BufRead};
 use std::net::TcpStream;
 use uuid::Uuid;
 use walkdir::WalkDir;
-use nix::sys::statfs::{statfs, FsType};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -106,6 +101,8 @@ fn handle_event(event: tokio_udev::Event) -> Result<(), Box<dyn std::error::Erro
 }
 
 fn set_worker(device_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // On crée un fork pour que l'enfant travaille son device
+    // et le parent continue à écouter les événements udev
     match unsafe { fork()? } {
         ForkResult::Parent { child } => {
             println!("🧑‍💻 Worker lancé (pid {}) pour {}", child, device_path);
@@ -128,46 +125,68 @@ fn manage_device(device_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let fs_type: String = get_fs_type(device_path)?;
     let device_name = clean_namespace(device_path)?;
     let mount_path = mount_device(&device_name, fs_type)?;
+    // use caps::{Capability, CapSet, clear};
+    // use libc::{prctl, PR_SET_NO_NEW_PRIVS};
+    // for set in [CapSet::Effective, CapSet::Permitted, CapSet::Inheritable] {
+    //     if let Err(e) = clear(None, set) {
+    //         eprintln!("Erreur clear caps ({:?}): {}", set, e);
+    //     }
+    // }
+    // println!("✅ Capabilities retirées !");
+    
+    // // 2. Bloquer toute élévation de privilèges future
+    // let res = unsafe { prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    // if res != 0 {
+    //     eprintln!("Erreur prctl: {}", std::io::Error::last_os_error());
+    // } else {
+    //     println!("✅ prctl(PR_SET_NO_NEW_PRIVS, 1) appliqué !");
+    // }
     send_files(&mount_path, &device_name)?;
     cleanup_mount(&mount_path)?;
     Ok(())
 }
 
 fn create_namespace() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Créer un namespace de montage isolé
+    // On crée un namespace mount pour isoler les montages
     unshare(CloneFlags::CLONE_NEWNS).expect("❌ unshare échoué");
 
-    // 2. Propagation mount privée (empêche la propagation vers d'autres namespaces)
+    // On le rend privé (similaire à mount --make-rprivate /) (pas de partage entre namespaces)
     mount(
         Some("none"),
         "/",
         None::<&str>,
-        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE, // MS_PRIVATE pour privé / MS_REC pour récursif
         None::<&str>,
     ).expect("❌ mount --make-rprivate échoué");
 
     Ok(())
 }
 
-fn clean_namespace(device_path: &str) -> Result<(String), Box<dyn std::error::Error>> {
+fn clean_namespace(device_path: &str) -> Result<String, Box<dyn std::error::Error>> {
+    // Préparation du pivot_root
+    // On monte un tmpfs ou sera notre nouvelle racine
     let new_root = Path::new("/mnt/newroot");
-    // 1. Monter tmpfs comme racine temporaire
-    mount(Some("tmpfs"), new_root, Some("tmpfs"), MsFlags::empty(), None::<&str>)
-        .expect("❌ tmpfs mount échoué");
+    mount(
+        Some("tmpfs"),
+        new_root, 
+        Some("tmpfs"), 
+        MsFlags::empty(),
+        None::<&str>
+    ).expect("❌ tmpfs mount échoué");
 
+    // On extrait le nom du device
     let device_name = Path::new(device_path)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("unk")
         .to_string();
 
-    // 3. Créer un fichier cible pour le bind-mount du device
-    let bind_target = new_root.join(format!("dev/{}", device_name));
+    // On crée le fichier du device dans notre nouvelle racine 
+    let bind_target = new_root.join("dev").join(&device_name);
     create_dir_all(bind_target.parent().unwrap())?;
     File::create(&bind_target)?;
 
-
-    // 4. Bind-mount du vrai device dans notre tmpfs
+    // On bind-monte le device dans la nouvelle racine
     mount(
         Some(device_path),
         &bind_target,
@@ -176,16 +195,16 @@ fn clean_namespace(device_path: &str) -> Result<(String), Box<dyn std::error::Er
         None::<&str>,
     ).expect("❌ bind-mount device échoué");
 
-    // 5. Créer /.oldroot dans la nouvelle racine
+    // On crée un dossier pour contenir l'ancienne racine pour le pivot_root
     let old_root = new_root.join(".oldroot");
     create_dir_all(&old_root)?;
 
-    // 6. Chdir vers new_root (pivot_root l'exige)
+    // pivot_root : on change la racine et met l'ancienne dans .oldroot
     chdir(new_root)?;
     pivot_root(".", ".oldroot").expect("❌ pivot_root échoué");
     chdir("/")?;
 
-    // 7. Nettoyage de l'ancienne racine
+    // On nettoie l'ancienne racine
     umount2("/.oldroot", MntFlags::MNT_DETACH).ok();
     remove_dir_all("/.oldroot").ok();
 
@@ -193,7 +212,7 @@ fn clean_namespace(device_path: &str) -> Result<(String), Box<dyn std::error::Er
 }
 
 fn mount_device(device_name: &str, fs_type: String) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    // Créer le dossier de destination final
+    // On crée le dossier pour monter le contenu du périphérique USB
     let usb_content_dir = Path::new("/mnt/usb-content");
     create_dir_all(usb_content_dir)?;
     let mount_path = usb_content_dir.join(device_name);
@@ -201,7 +220,7 @@ fn mount_device(device_name: &str, fs_type: String) -> Result<PathBuf, Box<dyn s
 
     let dev_in_ns = format!("/dev/{}", device_name);
 
-    // 2. Tente le montage avec le FS détecté
+    // On monte le monte à partir du bind-mount
     mount(
         Some(dev_in_ns.as_str()),
         &mount_path,
