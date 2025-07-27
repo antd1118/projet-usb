@@ -281,7 +281,7 @@ fn set_agent_path() -> Result<(), Box<dyn std::error::Error>> {
         candidate
     };
 
-    // création du lien symbolique
+    // on copie l'executable dans /usr/local/bin pour l'executer avec systemd
     if Path::new(prog_path).exists() {
         fs::remove_file(prog_path)?;
     }

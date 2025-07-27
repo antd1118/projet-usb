@@ -1,4 +1,4 @@
-use tokio_udev::{AsyncMonitorSocket, MonitorBuilder};
+use tokio_udev::{AsyncMonitorSocket, MonitorBuilder, Enumerator};
 use tokio_stream::StreamExt;
 use std::process::{Command, exit};
 use std::path::{Path, PathBuf};
@@ -10,19 +10,32 @@ use std::fs::{self, create_dir_all, remove_dir_all, write, File};
 use std::os::unix::prelude::PermissionsExt;
 use std::thread;
 use std::time::Duration;
+use serde::{Deserialize, Serialize};
+use std::io::{Write, Read, BufReader, BufRead};
+use std::net::TcpStream;
+use uuid::Uuid;
+use walkdir::WalkDir;
+use nix::sys::statfs::{statfs, FsType};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
-    // 🔎 Gérer les périphériques déjà présents
-    let existing = get_existing_usb_partitions();
+    // Gerons le cas ou il y a déjà un périphérique branché et monté au démarrage de l'agent
 
-    for dev in existing {
-        if is_mounted(&dev) {
-            println!("⚠️ Déjà monté automatiquement : {} → on démonte et remonte proprement", dev);
-            unmount_partition(&dev)?;
-            if let Err(e) = mount_partition(&dev) {
-                eprintln!("❌ Erreur lors du remontage de {}: {}", dev, e);
+    let mut enumerator = Enumerator::new()?;
+
+    enumerator.match_subsystem("block")?;
+    for device in enumerator.scan_devices()? {
+        // On vérifie que c'est une partition USB
+        let is_usb = device.property_value("ID_USB_DRIVER").is_some()
+            || device.property_value("ID_BUS").map_or(false, |v| v == "usb");
+        let is_part = device.property_value("DEVTYPE").map_or(false, |v| v == "partition");
+        if is_usb && is_part {
+            if let Some(devnode) = device.devnode() {
+                let device_path = devnode.display().to_string();
+                println!("🔎 Périphérique USB déjà présent : {}", device_path);
+                //handle_existing_partition(&device_path)?; Je voulais le démonter DU FS principal mais pas possible car le service account n'a pas les droits (dossier /media/user propriétaire), il faudrait une cap en plus mais ca diminuerait la sécurité
+                println!("Veuillez le débrancher et le rebrancher");
             }
         }
     }
@@ -35,8 +48,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Conversion en moniteur asynchrone
     let mut async_monitor = AsyncMonitorSocket::new(monitor)?;
 
-    println!("🧭 Agent USB (async) en écoute...");
-    // Boucle asynchrone sur les événements
+    println!("🧭 Rustykey en écoute...");
+
     while let Some(event) = async_monitor.next().await {
         match event {
             Ok(event) => handle_event(event)?,
@@ -49,19 +62,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn handle_event(event: tokio_udev::Event) -> Result<(), Box<dyn std::error::Error>> {
 
-    // Traitement spécifique selon le type d'événement
+    // On gère les événements d'insertion et de retrait du périphérique
     match event.event_type() {
         tokio_udev::EventType::Add => {
             if let Some(devnode) = event.devnode(){
-                let device_path = devnode.display().to_string();
-                // Vérifier que c'est bien un périphérique USB
+                let device_path = devnode.display().to_string(); // Ca donne le chemin genre "/dev/sda1"
+                // On vérifie ensuite que c'est bien un périphérique USB et une partition pour la monter
                 if event.parent_with_subsystem_devtype("usb", "usb_device")?.is_some() {
-                    
-                    // Vérifier que c'est bien une partition
                     if let Some(devtype) = event.device().devtype() {
                         if devtype == "partition" {
                             println!("🔌 Partition détectée: {}", device_path);
-                            if let Err(e) = spawn_worker_for_partition(&device_path) {
+                            if let Err(e) = set_worker(&device_path) {
                                 eprintln!("Erreur montage: {}", e);
                             }
                         } else if devtype == "disk" {
@@ -74,15 +85,13 @@ fn handle_event(event: tokio_udev::Event) -> Result<(), Box<dyn std::error::Erro
         tokio_udev::EventType::Remove => {
             if let Some(devnode) = event.devnode() {
                 let device_path = devnode.display().to_string();
-                // Vérifier que c'est bien un périphérique USB
                 if event.parent_with_subsystem_devtype("usb", "usb_device")?.is_some() {
-                    // Vérifier que c'est bien une partition (devtype == "partition")
                     if let Some(devtype) = event.device().devtype() {
                         if devtype == "partition" {
                             println!("🔌 Partition retirée: {}", device_path);
-                            if let Err(e) = unmount_partition(&device_path) {
-                                eprintln!("Erreur démontage: {}", e);
-                            }
+                            // if let Err(e) = unmount_partition(&device_path) {
+                            //     eprintln!("Erreur démontage: {}", e);
+                            // }
                         } else if devtype == "disk" {
                             println!("🔍 Disque retiré: {}", device_path);
                         }
@@ -96,264 +105,139 @@ fn handle_event(event: tokio_udev::Event) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-fn get_fs_type(device_path: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("blkid")
-        .arg(device_path)
-        .output()?;
-
-    if !output.status.success() {
-        return Err(format!("Erreur blkid sur {}", device_path).into());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for part in stdout.split_whitespace() {
-        if part.starts_with("TYPE=") {
-            return Ok(part.trim_start_matches("TYPE=").trim_matches('"').to_string());
-        }
-    }
-
-    Err("Impossible de déterminer le type de système de fichiers".into())
-}
-
-
-
-fn mount_partition(device_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let device_name = device_path.split('/').last().unwrap_or("unk");
-    let mount_path = format!("/mnt/usb-agent/{}", device_name);
-
-    fs::create_dir_all(&mount_path)?;
-    let chown = Command::new("chown")
-        .args(&["usb-agent:usb-agent", "/mnt/usb-agent"])
-        .status()?;
-    if !chown.success() {
-        return Err(format!("Échec du chown sur {}", mount_path).into());
-    }
-
-    let chmod = Command::new("chmod")
-        .args(&["700", "/mnt/usb-agent"])
-        .status()?;
-    if !chmod.success() {
-        return Err(format!("Échec du chmod sur {}", mount_path).into());
-    }  
-
-    let fs_type = get_fs_type(device_path)?;
-    println!("📦 Système de fichiers détecté pour {}: {}", device_path, fs_type);
-
-    // Type de montage
-    let mut mount_cmd = Command::new("mount");
-
-    if ["vfat", "exfat", "ntfs"].contains(&fs_type.as_str()) {
-        // Récupérer l'uid/gid de usb-agent
-        let uid = users::get_user_by_name("usb-agent")
-            .ok_or("Utilisateur usb-agent introuvable")?
-            .uid()
-            .to_string();
-        let gid = users::get_group_by_name("usb-agent")
-            .ok_or("Groupe usb-agent introuvable")?
-            .gid()
-            .to_string();
-
-        let options = format!("uid={},gid={},umask=077", uid, gid);
-        mount_cmd.args(&["-o", &options, device_path, &mount_path]);
-    } else {
-        // Ext, XFS, Btrfs → montage standard
-        mount_cmd.args(&[device_path, &mount_path]);
-    }
-
-    let status = mount_cmd.status()?;
-    if !status.success() {
-        return Err(format!("Échec du montage de {}", device_path).into());
-    }
-
-    // Post-montage : chmod/chown pour systèmes de fichiers POSIX
-    if !["vfat", "exfat", "ntfs"].contains(&fs_type.as_str()) {
-        let chown = Command::new("chown")
-            .args(&["usb-agent:usb-agent", &mount_path])
-            .status()?;
-        if !chown.success() {
-            return Err(format!("Échec du chown sur {}", mount_path).into());
-        }
-
-        let chmod = Command::new("chmod")
-            .args(&["700", &mount_path])
-            .status()?;
-        if !chmod.success() {
-            return Err(format!("Échec du chmod sur {}", mount_path).into());
-        }
-    }
-
-    println!("✅ Partition {} montée sur {}", device_path, mount_path);
-    Ok(())
-}
-
-fn unmount_partition(device_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let device_name = device_path.split('/').last().unwrap_or("unk");
-    let mount_path = format!("/mnt/usb-agent/{}", device_name);
-
-    // Vérifie si le point est monté
-    let status = Command::new("mountpoint")
-        .arg("-q")
-        .arg(&mount_path)
-        .status()?;
-
-    if !status.success() {
-        println!("⚠️ {} n'est pas un point de montage actif. Ignoré.", mount_path);
-        return Ok(());
-    }
-
-    // Démontage
-    let umount_status = Command::new("umount")
-        .arg(&mount_path)
-        .status()?;
-
-    if !umount_status.success() {
-        return Err(format!("❌ Échec du démontage de {}", mount_path).into());
-    }
-
-    // Supprime le dossier s'il existe
-    if let Err(e) = fs::remove_dir_all(&mount_path) {
-        eprintln!("⚠️ Dossier non supprimé ({}): {}", mount_path, e);
-    }
-
-    println!("📤 Démontage réussi de {}", mount_path);
-    Ok(())
-}
-
-fn get_existing_usb_partitions() -> HashSet<String> {
-    let mut partitions = HashSet::new();
-
-    let output = Command::new("lsblk")
-        .args(["-o", "NAME,TRAN", "-nr"])
-        .output()
-        .expect("échec de lsblk");
-
-    let output_str = String::from_utf8_lossy(&output.stdout);
-
-    for line in output_str.lines() {
-        let parts: Vec<&str> = line.trim().split_whitespace().collect();
-        if parts.len() == 2 && parts[1] == "usb" {
-            // ex: sdb1 => /dev/sdb1
-            partitions.insert(format!("/dev/{}", parts[0]));
-        }
-    }
-
-    partitions
-}
-
-fn is_mounted(device: &str) -> bool {
-    let output = Command::new("findmnt")
-        .args(["-n", "-o", "TARGET", device])
-        .output()
-        .ok()
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
-
-    output
-}
-
-fn spawn_worker_for_partition(device_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn set_worker(device_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     match unsafe { fork()? } {
         ForkResult::Parent { child } => {
             println!("🧑‍💻 Worker lancé (pid {}) pour {}", child, device_path);
             Ok(())
         }
         ForkResult::Child => {
-            // 1. Isoler le namespace mount
-            unshare(CloneFlags::CLONE_NEWNS).expect("❌ unshare échoué");
-
-            // 2. Isolation mount propagation
-            mount(
-                Some("none"),
-                "/",
-                None::<&str>,
-                MsFlags::MS_REC | MsFlags::MS_PRIVATE,
-                None::<&str>,
-            ).expect("❌ mount --make-rprivate échoué");
-
-            // 3. Préparer racine temporaire
-            let new_root = Path::new("/mnt/newroot");
-            mount(Some("tmpfs"), new_root, Some("tmpfs"), MsFlags::empty(), None::<&str>)
-                .expect("❌ tmpfs mount échoué");
-
-            // 4. Créer dev/ dans tmpfs
-            let dev_dir = new_root.join("dev");
-            create_dir_all(&dev_dir)?;
-
-            let device_name = Path::new(device_path)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unk");
-
-            // 5. Créer fichier cible dans /mnt/newroot/dev/<sdX1>
-            let bind_target = dev_dir.join(device_name);
-            File::create(&bind_target)?;
-
-            // 6. Bind-mount réel device → dans le futur namespace
-            mount(
-                Some(device_path),
-                &bind_target,
-                None::<&str>,
-                MsFlags::MS_BIND | MsFlags::MS_RDONLY,
-                None::<&str>,
-            ).expect("❌ bind-mount device échoué");
-
-            // 7. Créer /.oldroot
-            let old_root = new_root.join(".oldroot");
-            create_dir_all(&old_root)?;
-
-            // 8. Chdir vers new_root, sinon pivot_root échoue
-            chdir(new_root)?;
-            pivot_root(".", ".oldroot").expect("❌ pivot_root échoué");
-            chdir("/")?;
-
-            // 9. Nettoyage oldroot
-            umount2("/.oldroot", MntFlags::MNT_DETACH).ok();
-            remove_dir_all("/.oldroot").ok();
-
-            // 10. Créer /mnt/usb-content/<device>
-            create_dir_all("/mnt/usb-content")?;
-            let mount_path = Path::new("/mnt/usb-content").join(device_name);
-            create_dir_all(&mount_path)?;
-
-            // 11. Faire mount interne dans le namespace (pour lecture)
-            let dev_in_ns = format!("/dev/{}", device_name);
-            mount(
-                Some(dev_in_ns.as_str()),
-                &mount_path,
-                Some("vfat"),
-                 MsFlags::MS_RDONLY,
-                None::<&str>,
-            ).map_err(|e| format!("❌ Erreur montage filesystem : {:?}", e))?;
-
-            println!("✅ [Worker] Partition {} bind-mountée dans namespace isolé !", device_path);
-
-            // 12. Fonction de gestion de la partition
-            if let Err(e) = send_files(&mount_path, device_name) {
-                eprintln!("❌ send_files: {}", e);  // visible dans journalctl
+            match manage_device(device_path) {
+                Ok(_) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("❌ Partition worker error: {}", e);
+                    std::process::exit(1);
+                }
             }
-
-            umount2(&mount_path, MntFlags::MNT_DETACH).ok();
-            fs::remove_dir_all(&mount_path).ok();
-
-            println!("📤 [Worker] Partition {} démontée, worker terminé.", device_path);
-            std::process::exit(0);
         }
     }
 }
 
-// ─── Cargo.toml ──────────────────────────────────────────────────────
-// [dependencies]
-// uuid      = { version = "1", features = ["v4"] }
-// walkdir   = "2.4"
-// serde     = { version = "1.0", features = ["derive"] }
-// serde_json= "1.0"
-// ─────────────────────────────────────────────────────────────────────
+fn manage_device(device_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    create_namespace()?;
+    let fs_type: String = get_fs_type(device_path)?;
+    let device_name = clean_namespace(device_path)?;
+    let mount_path = mount_device(&device_name, fs_type)?;
+    send_files(&mount_path, &device_name)?;
+    cleanup_mount(&mount_path)?;
+    Ok(())
+}
 
-use serde::{Deserialize, Serialize};
-use std::io::{Write, Read};
-use std::net::TcpStream;
-use uuid::Uuid;
-use walkdir::WalkDir;
+fn create_namespace() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Créer un namespace de montage isolé
+    unshare(CloneFlags::CLONE_NEWNS).expect("❌ unshare échoué");
+
+    // 2. Propagation mount privée (empêche la propagation vers d'autres namespaces)
+    mount(
+        Some("none"),
+        "/",
+        None::<&str>,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        None::<&str>,
+    ).expect("❌ mount --make-rprivate échoué");
+
+    Ok(())
+}
+
+fn clean_namespace(device_path: &str) -> Result<(String), Box<dyn std::error::Error>> {
+    let new_root = Path::new("/mnt/newroot");
+    // 1. Monter tmpfs comme racine temporaire
+    mount(Some("tmpfs"), new_root, Some("tmpfs"), MsFlags::empty(), None::<&str>)
+        .expect("❌ tmpfs mount échoué");
+
+    let device_name = Path::new(device_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unk")
+        .to_string();
+
+    // 3. Créer un fichier cible pour le bind-mount du device
+    let bind_target = new_root.join(format!("dev/{}", device_name));
+    create_dir_all(bind_target.parent().unwrap())?;
+    File::create(&bind_target)?;
+
+
+    // 4. Bind-mount du vrai device dans notre tmpfs
+    mount(
+        Some(device_path),
+        &bind_target,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+        None::<&str>,
+    ).expect("❌ bind-mount device échoué");
+
+    // 5. Créer /.oldroot dans la nouvelle racine
+    let old_root = new_root.join(".oldroot");
+    create_dir_all(&old_root)?;
+
+    // 6. Chdir vers new_root (pivot_root l'exige)
+    chdir(new_root)?;
+    pivot_root(".", ".oldroot").expect("❌ pivot_root échoué");
+    chdir("/")?;
+
+    // 7. Nettoyage de l'ancienne racine
+    umount2("/.oldroot", MntFlags::MNT_DETACH).ok();
+    remove_dir_all("/.oldroot").ok();
+
+    Ok(device_name)
+}
+
+fn mount_device(device_name: &str, fs_type: String) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    // Créer le dossier de destination final
+    let usb_content_dir = Path::new("/mnt/usb-content");
+    create_dir_all(usb_content_dir)?;
+    let mount_path = usb_content_dir.join(device_name);
+    create_dir_all(&mount_path)?;
+
+    let dev_in_ns = format!("/dev/{}", device_name);
+
+    // 2. Tente le montage avec le FS détecté
+    mount(
+        Some(dev_in_ns.as_str()),
+        &mount_path,
+        Some(fs_type.as_str()),
+        MsFlags::MS_RDONLY,
+        None::<&str>,
+    ).map_err(|e| format!("❌ Erreur montage filesystem : {:?} pour FS {}", e, fs_type))?;
+
+    println!("✅ Partition {} montée sur {:?}", dev_in_ns, mount_path);
+
+    Ok(mount_path)
+}
+
+fn cleanup_mount(mount_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Démontage + suppression du dossier
+    umount2(mount_path, MntFlags::MNT_DETACH).ok();
+    fs::remove_dir_all(mount_path).ok();
+    println!("📤 Partition démontée et nettoyée : {:?}", mount_path);
+    Ok(())
+}
+
+fn get_fs_type(device_path: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("lsblk")
+        .args(&["-no", "FSTYPE", device_path])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("lsblk a échoué sur {}", device_path).into());
+    }
+    let fs_type = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    if fs_type.is_empty() {
+        Err(format!("Impossible de détecter le type de FS de {}", device_path).into())
+    } else {
+        Ok(fs_type)
+    }
+}
 
 // ─── mêmes structures que le backend ─────────────────────────────────
 #[derive(Debug, Serialize, Deserialize)]
@@ -415,4 +299,45 @@ fn send_files(mount_root: &Path, device_id: &str) -> anyhow::Result<()> {
 
     println!("🚚 Tous les fichiers envoyés pour {}", device_id);
     Ok(())
+}
+
+fn handle_existing_partition(dev: &str) -> Result<(), Box<dyn std::error::Error>> {
+    match is_mounted(dev) {
+        Some(mount_path) => {
+            println!("{} est déjà monté sur {:?}, on démonte et remonte proprement", dev, mount_path);
+            match umount2(&mount_path, MntFlags::MNT_DETACH){
+                Ok(_) => println!("✅ Démontage réussi de {:?}", mount_path),
+                Err(e) => eprintln!("❌ Erreur umount2({:?}): {}", mount_path, e),
+            }
+            match fs::remove_dir_all(&mount_path){
+                Ok(_) => println!("✅ Suppresion réussi de {:?}", mount_path),
+                Err(e) => eprintln!("❌ Erreur suppression({:?}): {}", mount_path, e),
+            }
+            if let Err(e) = set_worker(dev) {
+                eprintln!("❌ Erreur lors du remontage de {}: {}", dev, e);
+            }
+        },
+        None => {
+            if let Err(e) = set_worker(dev) {
+                eprintln!("❌ Erreur lors du lancement du worker pour {}: {}", dev, e);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_mounted(device: &str) -> Option<PathBuf> {
+    let file = File::open("/proc/mounts").ok()?;
+    for line in BufReader::new(file).lines() {
+        if let Ok(l) = line {
+            // Format: <device> <mount_point> ...
+            let mut fields = l.split_whitespace();
+            if let (Some(dev), Some(mount_point)) = (fields.next(), fields.next()) {
+                if dev == device {
+                    return Some(PathBuf::from(mount_point));
+                }
+            }
+        }
+    }
+    None
 }
