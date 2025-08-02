@@ -45,7 +45,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     create_user()?;
     disable_automount()?;
-    set_agent_path()?;
+    copy_bin("rustykey-agent")?;
+    copy_bin("rustykey-worker")?;
+    copy_cert("ca.crt")?;
+    copy_cert("agent.crt")?;
+    copy_cert("agent.key")?;
     create_service()?;
 
     println!("🎉 Setup terminé.");
@@ -190,6 +194,8 @@ fn create_service() -> Result<(), Box<dyn std::error::Error>> {
         ProtectSystem=strict
         ProtectHome=true
         ReadOnlyPaths=/
+        RuntimeDirectory=rustykey
+        ReadWritePaths=/run/rustykey
         ProtectKernelModules=true
         ProtectKernelTunables=true
         ProtectKernelLogs=true
@@ -258,19 +264,19 @@ fn disable_app() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Fonction pour trouver le chemin de l'executable agent et créer un lien symbolique dans /usr/local/bin pour faciliter l'exécution avec systemd
+// Fonction pour trouver les executables et créer une copie dans /usr/local/bin pour faciliter les exécutions
 
-fn set_agent_path() -> Result<(), Box<dyn std::error::Error>> {
-    let prog_path = "/usr/local/bin/rustykey-agent";
+fn copy_bin(bin_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let prog_path = format!("/usr/local/bin/{bin_name}");
 
     // auto-détection dans le même dossier que le setup
     let setup_dir = std::env::current_exe()?.parent().unwrap().to_path_buf();
-    let candidate = setup_dir.join("rustykey-agent");
+    let candidate = setup_dir.join(bin_name);
     let agent_path = if candidate.exists() {
         candidate
     } else {
         // sinon demander à l'utilisateur
-        println!("Veuillez entrer le chemin complet vers le binaire 'rustykey-agent' :");
+        println!("Veuillez entrer le chemin complet vers le binaire '{bin_name}' :");
         io::stdout().flush()?;
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;
@@ -283,11 +289,63 @@ fn set_agent_path() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // on copie l'executable dans /usr/local/bin pour l'executer avec systemd
-    if Path::new(prog_path).exists() {
-        fs::remove_file(prog_path)?;
+    if Path::new(&prog_path).exists() {
+        fs::remove_file(&prog_path)?;
     }
-    fs::copy(&agent_path, prog_path)?;
-    fs::set_permissions(prog_path, fs::Permissions::from_mode(0o755))?;
-    println!("✅ Programme copié dans {:?}", prog_path);
+    fs::copy(&agent_path, &prog_path)?;
+    fs::set_permissions(&prog_path, fs::Permissions::from_mode(0o755))?;
+    println!("✅ Programme copié dans {prog_path}");
+    Ok(())
+}
+
+fn copy_cert(cert_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let dest_dir = PathBuf::from("/etc/rustykey");
+    let cert_path = dest_dir.join(cert_name);
+
+    // Détection du chemin source à utiliser
+    let src: PathBuf = {
+        // On tente agent/<cert_name> relatif à l’exécutable (ex: ./target/debug/…)
+        let setup_dir = std::env::current_exe()?.parent().unwrap().to_path_buf();
+        let agent_dir = setup_dir.parent().and_then(|p| p.parent()).map(|p| p.join("agent"));
+        if let Some(agent_dir) = agent_dir {
+            let exe_candidate = agent_dir.join(cert_name);
+            if exe_candidate.exists() {
+                println!("✅ Trouvé : {}", exe_candidate.display());
+                exe_candidate
+            } else {
+                // Sinon demande à l’utilisateur
+                println!("❓ Veuillez entrer le chemin complet vers '{cert_name}': ");
+                io::stdout().flush()?;
+                let mut answer = String::new();
+                io::stdin().read_line(&mut answer)?;
+                let answer = answer.trim();
+                let candidate = PathBuf::from(answer);
+                if !candidate.exists() {
+                    return Err(format!("❌ Chemin invalide ou fichier inexistant : {answer}").into());
+                }
+                candidate
+            }
+        } else {
+            return Err("Impossible de déterminer le chemin du dossier agent".into());
+        }
+    };
+
+    if !dest_dir.exists() {
+        fs::create_dir_all(&dest_dir)?;
+        Command::new("chown")
+            .args(["usb-agent:usb-agent", "/etc/rustykey"])
+            .status()?;
+    }
+
+    // Copie le fichier
+    fs::copy(&src, &cert_path)?;
+    // Permissions 600
+    fs::set_permissions(&cert_path, fs::Permissions::from_mode(0o600))?;
+    // Changement de propriétaire
+    Command::new("chown")
+        .args(["usb-agent:usb-agent", cert_path.to_str().unwrap()])
+        .status()?;
+
+    println!("✅ Certificat {} copié vers {} (600, usb-agent:usb-agent)", src.display(), cert_path.display());
     Ok(())
 }
