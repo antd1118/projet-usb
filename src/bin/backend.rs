@@ -16,7 +16,6 @@ use axum::{
     extract::Multipart,
     response::Json as ResponseJson,
 };
-use axum_server::tls_rustls::RustlsConfig;
 use std::fs::create_dir_all;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -24,9 +23,16 @@ use tokio::time::sleep;
 use walkdir::WalkDir;
 use serde_json::json;
 use base64::{engine::general_purpose, Engine as _};
-use axum_server::tls_rustls::RustlsAcceptor;
+use axum_server::tls_rustls::RustlsConfig;
 use std::fs::File;
 use std::io::BufReader;
+use std::sync::Arc;
+use rustls::pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+};
+use rustls::{RootCertStore, ServerConfig};
+use rustls::server::WebPkiClientVerifier;
+use rustls_pemfile as pem;
 
 #[derive(Deserialize)]
 struct ManifestFile {
@@ -95,27 +101,24 @@ async fn upload_manifest(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    
-    // IMPORTANT: Initialiser le CryptoProvider avant toute autre opération TLS
-    rustls::crypto::ring::default_provider()
-        .install_default()
+    rustls::crypto::ring::default_provider().install_default()
         .map_err(|_| anyhow::anyhow!("Failed to install crypto provider"))?;
-
-    // Méthode 2: Configuration manuelle avec CA séparé
-    let config = create_tls_config_with_ca().await?;
-
-    // Configuration de l'application Axum
+    
+    let tls_config = build_mtls_config_with_http2(
+        "backend/backend.crt",
+        "backend/backend.key",
+        "backend/ca.crt",
+    )?;
+    
     let app = Router::new()
-        // .route("/init", post(init_session))
         .route("/upload", post(upload_manifest));
-        // .route("/complete", post(complete_session));
-
-    println!("✅ Backend RustyKey TLS en écoute sur 8443");
-
-    // Serveur TLS avec axum-server
+    
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 8443));
     
-    axum_server::bind_rustls(addr, config)
+    println!("Serveur mTLS + HTTP/2 démarré sur https://{}:8443", addr.ip());
+    
+    // Configuration du serveur avec support HTTP/2
+    axum_server::bind_rustls(addr, tls_config)
         .serve(app.into_make_service())
         .await
         .context("TLS server error")?;
@@ -145,37 +148,73 @@ async fn main() -> anyhow::Result<()> {
     // }
 }
 
-async fn create_tls_config_with_ca() -> anyhow::Result<RustlsConfig> {
-    // Lecture du certificat serveur
-    let cert_file = tokio::fs::read("backend/backend.crt").await
-        .context("Failed to read server certificate")?;
-    let cert_pem = String::from_utf8(cert_file)
-        .context("Server certificate is not valid UTF-8")?;
+fn load_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let mut rd = BufReader::new(File::open(path)?);
+    Ok(pem::certs(&mut rd)?.into_iter().map(CertificateDer::from).collect())
+}
 
-    // Lecture de la clé privée
-    let key_file = tokio::fs::read("backend/backend.key").await
-        .context("Failed to read private key")?;
-    let key_pem = String::from_utf8(key_file)
-        .context("Private key is not valid UTF-8")?;
+fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
+    // PKCS#8
+    {
+        let mut rd = BufReader::new(File::open(path)?);
+        if let Some(pkcs8) = pem::pkcs8_private_keys(&mut rd)?.into_iter().next() {
+            return Ok(PrivateKeyDer::from(PrivatePkcs8KeyDer::from(pkcs8)));
+        }
+    }
+    // PKCS#1 (RSA)
+    {
+        let mut rd = BufReader::new(File::open(path)?);
+        if let Some(rsa) = pem::rsa_private_keys(&mut rd)?.into_iter().next() {
+            return Ok(PrivateKeyDer::from(PrivatePkcs1KeyDer::from(rsa)));
+        }
+    }
+    // SEC1 (EC)
+    {
+        let mut rd = BufReader::new(File::open(path)?);
+        if let Some(sec1) = pem::ec_private_keys(&mut rd)?.into_iter().next() {
+            return Ok(PrivateKeyDer::from(PrivateSec1KeyDer::from(sec1)));
+        }
+    }
+    anyhow::bail!("no private key found in {path}");
+}
 
-    // Lecture du certificat CA
-    let ca_file = tokio::fs::read("backend/ca.crt").await
-        .context("Failed to read CA certificate")?;
-    let ca_pem = String::from_utf8(ca_file)
-        .context("CA certificate is not valid UTF-8")?;
+fn load_client_ca_store(path: &str) -> Result<RootCertStore> {
+    let mut rd = BufReader::new(File::open(path)?);
+    let mut store = RootCertStore::empty();
+    for der in pem::certs(&mut rd)? {
+        store.add(CertificateDer::from(der))?;
+    }
+    Ok(store)
+}
 
-    // Création de la chaîne complète (serveur + CA)
-    let full_chain = format!("{}\n{}", cert_pem, ca_pem);
-
-    // Configuration avec la chaîne complète
-    let config = RustlsConfig::from_pem(
-        full_chain.into_bytes(),
-        key_pem.into_bytes(),
-    )
-    .await
-    .context("Failed to create TLS config from PEM data")?;
-
-    Ok(config)
+fn build_mtls_config_with_http2(
+    server_cert_path: &str,
+    server_key_path: &str,
+    client_ca_path: &str,
+) -> Result<RustlsConfig> {
+    let cert_chain = load_cert_chain(server_cert_path).context("load server cert chain")?;
+    let priv_key = load_private_key(server_key_path).context("load server key")?;
+    let client_ca = load_client_ca_store(client_ca_path).context("load client CA")?;
+    
+    let verifier = WebPkiClientVerifier::builder(Arc::new(client_ca))
+        .build()
+        .context("build client verifier")?;
+    
+    // Configuration ServerConfig avec ALPN pour HTTP/2
+    let mut server_cfg = ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(cert_chain, priv_key)
+        .context("with_single_cert")?;
+    
+    // IMPORTANT: Configuration explicite d'ALPN pour HTTP/2
+    server_cfg.alpn_protocols = vec![
+        b"h2".to_vec(),      // HTTP/2
+        b"http/1.1".to_vec(), // HTTP/1.1 en fallback
+    ];
+    
+    println!("✅ ALPN configuré: h2, http/1.1");
+    
+    Ok(RustlsConfig::from_config(Arc::new(server_cfg)))
 }
 
 
