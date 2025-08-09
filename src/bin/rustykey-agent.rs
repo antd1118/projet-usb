@@ -6,6 +6,7 @@ use nix::mount::{umount2, MntFlags};
 use std::fs::{self, File};
 use std::io::{BufReader, BufRead};
 use std::process::Stdio;
+use std::ffi::OsStr;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,22 +20,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // On vérifie que c'est une partition USB
         let is_usb = device.property_value("ID_USB_DRIVER").is_some()
             || device.property_value("ID_BUS").map_or(false, |v| v == "usb");
-        let is_part = device.property_value("DEVTYPE").map_or(false, |v| v == "partition");
-        if is_usb && is_part {
+        let is_partition = device.property_value("DEVTYPE").map_or(false, |v| v == "partition");
+        if is_usb && is_partition {
             if let Some(devnode) = device.devnode() {
                 let device_path = devnode.display().to_string();
-                println!("🔎 Périphérique USB déjà présent : {}", device_path);
-                //handle_existing_partition(&device_path)?; Je voulais le démonter DU FS principal mais pas possible car le service account n'a pas les droits (dossier /media/user propriétaire), il faudrait une cap en plus mais ca diminuerait la sécurité
-                //println!("Veuillez le débrancher et le rebrancher");
-                tokio::spawn(async move {
-                    let status = Command::new("/usr/local/bin/rustykey-worker")
-                        .arg(&device_path)
-                        .status()
-                        .await;
-                    println!("→ Worker terminé avec code {:?}", status.ok().and_then(|s| s.code()));
-                });
+                println!("Périphérique USB déjà présent : {}", device_path);
+                //handle_existing_partition(&device_path)?; Je voulais le démonter du FS principal mais pas possible car le service account n'a pas les droits (dossier /media/user propriétaire), il faudrait une cap en plus mais ca diminuerait la sécurité
+                println!("Veuillez le débrancher et le rebrancher");
             } else {
-                println!("🔍 Périphérique USB détecté mais sans devnode");
+                println!("Périphérique USB détecté mais sans partition");
             }
         }
     }
@@ -47,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Conversion en moniteur asynchrone
     let mut async_monitor = AsyncMonitorSocket::new(monitor)?;
 
-    println!("🧭 Rustykey en écoute...");
+    println!("Rustykey en écoute...");
 
     while let Some(event) = async_monitor.next().await {
         match event {
@@ -64,49 +58,57 @@ fn handle_event(event: tokio_udev::Event) -> anyhow::Result<()> {
     // On gère les événements d'insertion et de retrait du périphérique
     match event.event_type() {
         tokio_udev::EventType::Add => {
-            if let Some(devnode) = event.devnode(){
-                let device_path = devnode.display().to_string(); // Ca donne le chemin genre "/dev/sda1"
-                // On vérifie ensuite que c'est bien un périphérique USB et une partition pour la monter
-                if event.parent_with_subsystem_devtype("usb", "usb_device")?.is_some() {
-                    if let Some(devtype) = event.device().devtype() {
-                        if devtype == "partition" {
-                            println!("🔌 Partition détectée: {}", device_path);
-                            tokio::spawn(async move {
-                                let status = Command::new("/usr/local/bin/rustykey-worker")
-                                    .arg(&device_path)
-                                    .stdout(Stdio::inherit())
-                                    .stderr(Stdio::inherit())
-                                    .status()
-                                    .await;
-                                match status {
-                                    Ok(status) => println!("→ Worker terminé avec code {:?}", status.code()),
-                                    Err(e) => eprintln!("Erreur au lancement du worker: {e}"),
-                                }
-                            });
-                        } else if devtype == "disk" {
-                            println!("🔍 Disque détecté: {}", device_path);
-                        }
+            // On vérifie que c'est bien un périphérique USB avec partition
+            let is_usb = event.parent_with_subsystem_devtype("usb", "usb_device")?.is_some();
+            let is_partition = event.device().devtype()
+                .as_deref()
+                .map_or(false, |t| t == OsStr::new("partition"));
+                if is_usb && is_partition {
+
+                    if let Some(devnode) = event.devnode() {
+                        // On récupère le chemin du périphérique (/dev/sda1 par exemple)
+                        let device_path = devnode.display().to_string();
+                        // On récupère le numéro de série du périphérique
+                        let device_id = event
+                            .device()
+                            .property_value("ID_SERIAL_SHORT")
+                            .map(|s| s.to_string_lossy().to_ascii_lowercase())
+                            .unwrap_or_else(|| "inconnu".into());
+
+                        println!("Périphérique inséré: {}. Numéro de série: {}", device_path, device_id);
+
+                        // On lance le worker en lui passant le chemin device à monter et le numéro de série
+                        tokio::spawn(async move {
+                            let status = Command::new("/usr/local/bin/rustykey-worker")
+                                .arg(&device_path)
+                                .arg(&device_id)
+                                .stdout(Stdio::inherit())
+                                .stderr(Stdio::inherit())
+                                .status()
+                                .await;
+                            match status {
+                                Ok(status) => println!("Traitement du périphérique (worker) terminé !"),
+                                Err(e) => eprintln!("Erreur au lancement du worker: {e}"),
+                            }
+                        });
                     }
                 }
             }
-        },
         tokio_udev::EventType::Remove => {
-            if let Some(devnode) = event.devnode() {
-                let device_path = devnode.display().to_string();
-                if event.parent_with_subsystem_devtype("usb", "usb_device")?.is_some() {
-                    if let Some(devtype) = event.device().devtype() {
-                        if devtype == "partition" {
-                            println!("🔌 Partition retirée: {}", device_path);
-                            // if let Err(e) = unmount_partition(&device_path) {
-                            //     eprintln!("Erreur démontage: {}", e);
-                            // }
-                        } else if devtype == "disk" {
-                            println!("🔍 Disque retiré: {}", device_path);
-                        }
-                    }
+            let is_usb = event.parent_with_subsystem_devtype("usb", "usb_device")?.is_some();
+            let is_partition = event.device().devtype()
+                .as_deref()
+                .map_or(false, |t| t == OsStr::new("partition"));
+            if is_usb && is_partition {
+                if let Some(devnode) = event.devnode() {
+                    let device_path = devnode.display().to_string();
+                    println!("Périphérique retirée: {}", device_path);
+                    // if let Err(e) = unmount_partition(&device_path) {
+                    //     eprintln!("Erreur démontage: {}", e);
+                    // }
                 }
             }
-        },
+        }
         _ => {}
     }
 
@@ -119,15 +121,15 @@ fn handle_existing_partition(dev: &str) -> Result<(), Box<dyn std::error::Error>
         println!("{} est déjà monté sur {:?}, on démonte et remonte proprement", dev, &mount_path);
 
         if let Err(e) = umount2(&mount_path, MntFlags::MNT_DETACH) {
-            eprintln!("❌ Erreur umount2({:?}): {}", &mount_path, e);
+            eprintln!("Erreur umount2({:?}): {}", &mount_path, e);
         } else {
-            println!("✅ Démontage réussi de {:?}", &mount_path);
+            println!("Démontage réussi de {:?}", &mount_path);
         }
 
         if let Err(e) = fs::remove_dir_all(&mount_path) {
-            eprintln!("❌ Erreur suppression({:?}): {}", &mount_path, e);
+            eprintln!("Erreur suppression({:?}): {}", &mount_path, e);
         } else {
-            println!("✅ Suppression réussie de {:?}", &mount_path);
+            println!("Suppression réussie de {:?}", &mount_path);
         }
     }
 

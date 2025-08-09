@@ -1,36 +1,34 @@
-use std::process::{Command};
-use std::path::{Path, PathBuf};
-use nix::sched::{unshare, CloneFlags};
-use nix::mount::{mount, umount2, MsFlags, MntFlags};
-use nix::unistd::{fork, ForkResult, pivot_root, chdir};
-use std::fs::{self, create_dir_all, remove_dir_all, File};
-use serde::{Deserialize, Serialize};
-use std::io::{BufReader, BufRead};
+use anyhow::{Context, Result};
 use caps::{CapSet, clear};
 use libc::{prctl, PR_SET_NO_NEW_PRIVS};
-use std::sync::Arc;
-use tokio_rustls::TlsConnector;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use rustls::{ClientConfig, RootCertStore, pki_types::{CertificateDer, PrivateKeyDer, ServerName}};
-use bincode::{Encode, Decode};
+use nix::mount::{mount, umount2, MntFlags, MsFlags};
+use nix::sched::{unshare, CloneFlags};
+use nix::unistd::{chdir, fork, ForkResult, pivot_root};
+use serde::{Deserialize, Serialize};
 use std::env;
-use tokio::time::timeout;
-use std::time::Duration;
-use anyhow::{Result, Context};
+use std::fs::{self, create_dir_all, remove_dir_all};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use walkdir::WalkDir;
+use base64::{engine::general_purpose, Engine as _};
+use reqwest::{ Identity, Certificate};
+use reqwest::Client as HttpClient;
+
 fn main() {
     if let Err(e) = run_worker() {
-        eprintln!("❌ rustykey-worker: {e:#}");
+        eprintln!("ERREUR WORKER : {e:#}");
         std::process::exit(1);
     }
 }
 
 fn run_worker() -> Result<()> {
 
-    let device_path = env::args().nth(1)
-        .ok_or_else(|| anyhow::anyhow!("❌ Aucun chemin de périphérique fourni"))?;
+    let mut args = env::args().skip(1);        // arg[0] = binaire
+    let device_path = args.next().ok_or_else(|| anyhow::anyhow!("Pas de partition"))?;
+    let device_id = args.next().unwrap_or_else(|| "inconnu".into());
+
     if !Path::new(&device_path).exists() {
-        return Err(anyhow::anyhow!("❌ Le périphérique {} n'existe pas", device_path));
+        return Err(anyhow::anyhow!("Le périphérique à {} n'existe pas", device_path));
     }
 
     create_namespace()?;
@@ -48,7 +46,10 @@ fn run_worker() -> Result<()> {
                 let fs_type = get_fs_type(&device_path)?;
                 let mount_path = do_pivot_root(&device_path, fs_type)?;
                 drop_cap()?;
-                send_files(mount_path).await
+                let files = build_manifest(&mount_path).await?;
+                let client = build_mtls_client()?;
+                send_manifest("https://rustykey-backend.local:8443/upload", &device_id, files, &client).await?;
+                Ok::<(), anyhow::Error>(())
             })?;
         }
     }
@@ -63,7 +64,7 @@ fn create_namespace() -> Result<()> {
         CloneFlags::CLONE_NEWUTS |
         CloneFlags::CLONE_NEWIPC;
 
-    unshare(flags).context("❌ unshare échoué")?;
+    unshare(flags).context("unshare échoué")?;
 
     // On le rend privé (similaire à mount --make-rprivate /) (pas de partage entre namespaces)
     mount(
@@ -72,7 +73,7 @@ fn create_namespace() -> Result<()> {
         None::<&str>,
         MsFlags::MS_REC | MsFlags::MS_PRIVATE, // MS_PRIVATE pour privé / MS_REC pour récursif
         None::<&str>,
-    ).context("❌ mount --make-rprivate échoué")?;
+    ).context("mount --make-rprivate échoué")?;
 
     Ok(())
 }
@@ -88,9 +89,9 @@ fn do_pivot_root(device_path: &str, fs_type: String) -> Result<PathBuf> {
         Some("tmpfs"), 
         MsFlags::empty(),
         None::<&str>
-    ).context("❌ tmpfs mount échoué")?;
+    ).context("tmpfs mount échoué")?;
 
-    // On extrait le nom du device
+    // On extrait le nom du device (sda1 par exemple)
     let device_name = Path::new(device_path)
         .file_name()
         .and_then(|s| s.to_str())
@@ -99,17 +100,17 @@ fn do_pivot_root(device_path: &str, fs_type: String) -> Result<PathBuf> {
 
     // On crée le fichier du device dans notre nouvelle racine
     let mount_path = PathBuf::from(format!("mnt/{}", device_name));
-    let bind_target = new_root.join(&mount_path);
-    create_dir_all(&bind_target)?;
+    let target = new_root.join(&mount_path);
+    create_dir_all(&target)?;
 
     // On monte le device dans la nouvelle racine
     mount(
         Some(device_path),
-        &bind_target,
+        &target,
         Some(fs_type.as_str()),
         MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC | MsFlags::MS_NOATIME, // flags pour sécurité max
         None::<&str>,
-    ).context("❌ Mount device échoué")?;
+    ).context("Mount device échoué")?;
 
     // on bind mount le dossier qui contient les certificats
     create_dir_all("/run/rustykey/newroot/etc/rustykey")?;
@@ -119,16 +120,16 @@ fn do_pivot_root(device_path: &str, fs_type: String) -> Result<PathBuf> {
         None::<&str>,
         MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC | MsFlags::MS_NOATIME,
         None::<&str>,
-    ).context("❌ Bind mount échoué")?;
+    ).context("Bind mount échoué")?;
 
     // On crée un dossier pour contenir l'ancienne racine pour le pivot_root
     let old_root = new_root.join(".oldroot");
     create_dir_all(&old_root)?;
 
     // pivot_root : on change la racine et met l'ancienne dans .oldroot
-    chdir(new_root)?;
-    pivot_root(".", ".oldroot").expect("❌ pivot_root échoué");
-    chdir("/")?;
+    chdir(new_root).context("chdir(new_root) avant pivot_root")?;
+    pivot_root(".", ".oldroot").context("pivot_root('.', '.oldroot')")?;
+    chdir("/").context("chdir('/') après pivot_root")?;
 
     // Créer et monter /proc dans le nouveau root (isolé PID)
     create_dir_all("/proc")?;
@@ -138,7 +139,7 @@ fn do_pivot_root(device_path: &str, fs_type: String) -> Result<PathBuf> {
         Some("proc"),
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
         None::<&str>,
-    ).context("❌ mount proc échoué")?;
+    ).context("mount proc échoué")?;
 
     // On nettoie l'ancienne racine
     umount2("/.oldroot", MntFlags::MNT_DETACH).ok();
@@ -165,174 +166,84 @@ fn get_fs_type(device_path: &str) -> Result<String> {
 
 fn drop_cap() -> Result<()> {
 
-    // 1) Tout vider, y compris l’Ambient
+    // On supprime les capacités Ambient, Effective, Permitted et Inheritable
     for set in [CapSet::Ambient, CapSet::Effective, CapSet::Permitted, CapSet::Inheritable] {
         if let Err(e) = clear(None, set) {
-            eprintln!("Warn: clear {:?} -> {}", set, e);
+            eprintln!("Erreur clear cap {:?} : {}", set, e);
         }
     }
 
-    // 2) Verrouiller toute élévation future (setuid / file caps)
+    // On empêche l'acquisition de nouveaux privilèges 
     let ret = unsafe { prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if ret != 0 {
-        return Err(anyhow::anyhow!("Failed PR_SET_NO_NEW_PRIVS: {}", std::io::Error::last_os_error()));
+        return Err(anyhow::anyhow!("Erreur PR_SET_NO_NEW_PRIVS: {}", std::io::Error::last_os_error()));
     }
     
     Ok(())
 }
 
-#[derive(Debug, Serialize, Deserialize, Encode, Decode)]
-struct Manifest {
-    device_id: String,
-    session_id: String,
-    files: Vec<FileEntry>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Encode, Decode)]
-struct FileEntry {
+#[derive(Serialize)]
+struct ManifestFile {
     path: String,
-    size: u64,
+    data: String, // base64
 }
 
-#[derive(Debug, Serialize, Deserialize, Encode, Decode)]
-enum AgentMessage {
-    DeviceInserted {
-        device_id: String,
-        session_id: String,
-        manifest: Manifest,
-    },
-    // autres messages éventuels
-}
 
-#[derive(Debug, Serialize, Deserialize, Encode, Decode)]
-enum BackendResponse {
-    SessionAccepted { session_id: String },
-    SessionRejected { reason: String },
-    // autres variantes...
-}
+async fn build_manifest(mount_path: &Path) -> Result<Vec<ManifestFile>> {
+    let mut files = Vec::new();
+    // On parcours tous les fichiers à partir de mount_path
+    for entry in WalkDir::new(mount_path).follow_links(false).same_file_system(true).into_iter().filter_map(Result::ok) {
+        if entry.file_type().is_file() {
+            // Chemin relatif par rapport à mount_path
+            let rel_path = entry.path().strip_prefix(mount_path)
+                .unwrap_or(entry.path()) 
+                .to_string_lossy()
+                .to_string();
+            
+            // On lit le contenu du fichier et on l'encode en base64
+            let contents = tokio::fs::read(entry.path()).await?;
+            let encoded = general_purpose::STANDARD.encode(&contents);
 
-fn load_ca_certs(filename: &str) -> anyhow::Result<RootCertStore> {
-    let mut root_store = RootCertStore::empty();
-    let file = File::open(filename)?;
-    let mut reader = BufReader::new(file);
-    while let Some(item) = rustls_pemfile::read_one(&mut reader)? {
-        if let rustls_pemfile::Item::X509Certificate(cert) = item {
-            root_store.add(cert).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            files.push(ManifestFile { path: rel_path, data: encoded });
         }
     }
-    Ok(root_store)
+    Ok(files)
 }
 
-fn load_client_cert(filename: &str) -> anyhow::Result<Vec<CertificateDer<'static>>> {
-    let file = File::open(filename)?;
-    let mut reader = BufReader::new(file);
-    let mut certs = Vec::new();
-    while let Some(item) = rustls_pemfile::read_one(&mut reader)? {
-        if let rustls_pemfile::Item::X509Certificate(cert) = item {
-            certs.push(CertificateDer::from(cert));
-        }
-    }
-    Ok(certs)
+
+fn build_mtls_client() -> Result<HttpClient> {
+    let key = fs::read("/etc/rustykey/agent.key").context("read agent.key")?;
+    let crt = fs::read("/etc/rustykey/agent.crt").context("read agent.crt")?;
+    let mut id_pem = Vec::with_capacity(key.len()+crt.len()+64);
+    id_pem.extend_from_slice(&key);
+    id_pem.extend_from_slice(&crt);
+    let identity = Identity::from_pem(&id_pem).context("identity")?;
+
+    let ca = fs::read("/etc/rustykey/ca.crt").context("read ca.crt")?;
+    let ca_cert = Certificate::from_pem(&ca).context("CA")?;
+
+    Ok(HttpClient::builder()
+        .use_rustls_tls()
+        .add_root_certificate(ca_cert)
+        .identity(identity)
+        .resolve("rustykey-backend.local", "127.0.0.1:8443".parse().unwrap())
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("build reqwest client")?)
 }
 
-fn load_client_key(filename: &str) -> anyhow::Result<PrivateKeyDer<'static>> {
-    use rustls_pemfile::Item;
-    let file = File::open(filename)?;
-    let mut reader = BufReader::new(file);
-    while let Some(item) = rustls_pemfile::read_one(&mut reader)? {
-        match item {
-            Item::Pkcs8Key(key) => return Ok(PrivateKeyDer::Pkcs8(key)),
-            Item::Pkcs1Key(key) => return Ok(PrivateKeyDer::Pkcs1(key)),
-            Item::Sec1Key(key)  => return Ok(PrivateKeyDer::Sec1(key)),
-            _ => {}
-        }
+
+
+async fn send_manifest(url: &str, device_id: &str, files: Vec<ManifestFile>, client: &HttpClient) -> anyhow::Result<()> {
+
+    let body = serde_json::json!({
+        "device_id": device_id,
+        "files": files
+    });
+
+    let resp = client.post(url).json(&body).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("Erreur envoie des données au backend: {}", resp.status());
     }
-    Err(anyhow::anyhow!("No private key found"))
-}
-
-async fn send_files(folder: PathBuf) -> anyhow::Result<()> {
-    // === TLS Config ===
-    let ca_store = load_ca_certs("/etc/rustykey/ca.crt")?;
-    let certs = load_client_cert("/etc/rustykey/agent.crt")?;
-    let key = load_client_key("/etc/rustykey/agent.key")?;
-
-    let server_name = ServerName::try_from("rustykey-backend.local").unwrap();
-    let config = ClientConfig::builder()
-        .with_root_certificates(ca_store)
-        .with_client_auth_cert(certs, key)?;
-    let connector = TlsConnector::from(Arc::new(config));
-
-    println!("🔗 Tentative de connexion TCP...");
-    let stream = timeout(
-        Duration::from_secs(5),
-        tokio::net::TcpStream::connect("127.0.0.1:7878")
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("⏱️ Timeout TCP (backend injoignable)"))??;
-    let mut tls = connector.connect(server_name, stream).await?;
-    println!("✅ Connexion TLS OK");
-
-    // === Explore tous les fichiers récursivement ===
-    let mut files_to_send = Vec::new();
-    for entry in WalkDir::new(&folder)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
-        let rel_path = entry.path().strip_prefix(&folder).unwrap().to_string_lossy().to_string();
-        let size = entry.metadata()?.len();
-        files_to_send.push((rel_path, entry.path().to_owned(), size));
-    }
-
-    // === Prépare le manifest ===
-    let files: Vec<FileEntry> = files_to_send.iter()
-        .map(|(rel_path, _, size)| FileEntry {
-            path: rel_path.clone(),
-            size: *size,
-        })
-        .collect();
-
-    let manifest = Manifest {
-        device_id: "my-usb".to_string(),
-        session_id: "sess-42".to_string(),
-        files,
-    };
-
-    let message = AgentMessage::DeviceInserted {
-        device_id: manifest.device_id.clone(),
-        session_id: manifest.session_id.clone(),
-        manifest,
-    };
-    let serialized = bincode::encode_to_vec(&message, bincode::config::standard())?;
-    let len = (serialized.len() as u32).to_be_bytes();
-
-    tls.write_all(&len).await?;
-    tls.write_all(&serialized).await?;
-
-    // === Lecture de la réponse Backend ===
-    let mut resp_len_buf = [0u8; 4];
-    tls.read_exact(&mut resp_len_buf).await?;
-    let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
-    let mut resp_buf = vec![0u8; resp_len];
-    tls.read_exact(&mut resp_buf).await?;
-    let (response, _): (BackendResponse, _) = bincode::decode_from_slice(&resp_buf, bincode::config::standard())?;
-    println!("Backend response: {:?}", response);
-
-    // === Stream chaque fichier, dans l’ordre ===
-    for (rel_path, abs_path, size) in &files_to_send {
-        println!("➡️ Envoi fichier: {} ({} bytes)", rel_path, size);
-        let mut file = tokio::fs::File::open(abs_path).await?;
-        let mut remaining = *size;
-        let mut buf = [0u8; 8192];
-        while remaining > 0 {
-            let n = file.read(&mut buf).await?;
-            if n == 0 { break; }
-            tls.write_all(&buf[..n]).await?;
-            remaining -= n as u64;
-        }
-        println!("✅ Fichier envoyé: {}", rel_path);
-    }
-    println!("🎉 Tous les fichiers envoyés !");
     Ok(())
 }
-
