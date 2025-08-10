@@ -13,6 +13,7 @@ use axum::{
     Json, 
     Router,
     http::StatusCode,
+    extract::{State, Path as AxumPath}, 
 };
 use std::fs::create_dir_all;
 use tokio::sync::broadcast;
@@ -28,6 +29,11 @@ use rustls::pki_types::{
 use rustls::{RootCertStore, ServerConfig};
 use rustls::server::WebPkiClientVerifier;
 use rustls_pemfile as pem;
+use serde_json::Value;
+use tokio::sync::mpsc;
+use aws_sdk_s3::types::{NotificationConfiguration, QueueConfiguration, Event};
+use tokio::process::Command;
+use urlencoding::decode;
 
 #[derive(Deserialize)]
 struct ManifestFile {
@@ -41,17 +47,31 @@ struct UploadManifest {
     files: Vec<ManifestFile>,
 }
 
+// 
+#[derive(Debug, Clone)]
+struct SimpleEvent {
+    device_id: String,
+    action: String,
+    file_name: String,
+    file_data: Vec<u8>,
+}
+
 async fn upload_manifest(Json(payload): Json<UploadManifest>) -> Result<String, StatusCode> {
     // On se connecte à MinIO
     let s3 = connect_s3(
         "http://127.0.0.1:9000",
         "admin",
-        "9642!?!z1838iT2",
+        "password",
     ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // On crée le bucket pour le device
     let bucket = format!("rustykey-{}", payload.device_id);
     create_bucket(&s3, &bucket)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // On configure le webhook pour recevoir les notifications S3
+    config_webhook(&s3, &bucket)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -74,25 +94,46 @@ async fn main() -> anyhow::Result<()> {
     rustls::crypto::ring::default_provider().install_default()
         .map_err(|_| anyhow::anyhow!("Impossible d'instaler crypto ring"))?;
     
+    let s3_client = connect_s3(
+        "http://127.0.0.1:9000",
+        "admin",
+        "password",
+    ).await?;
+
     let tls_config = build_mtls(
         "backend/backend.crt",
         "backend/backend.key",
         "backend/ca.crt",
     )?;
     
+     // On crée un channel pour gérer un évènement S3 (création, suppression) de manière asynchrone
+    let (sender, receiver) = mpsc::unbounded_channel::<SimpleEvent>();
+
+    tokio::spawn(async move {
+        process_events(receiver).await;
+    });
+
+    //let webhook_token = std::env::var("RUSTYKEY_WEBHOOK_TOKEN").ok().map(Arc::new);
+    
     let app = Router::new()
-        .route("/upload", post(upload_manifest));
+        .route("/upload", post(upload_manifest))
+        .route("/webhook", post(webhook_handler).with_state((sender, s3_client))); // Route pour le webhook S3
     
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 8443));
-        
-    // On démarre le serveur
-    axum_server::bind_rustls(addr, tls_config)
-        .serve(app.into_make_service())
-        .await
-        .context("TLS server error")?;
 
-    println!("Serveur mTLS + HTTP2 démarré sur https://{}:8443", addr.ip());
+    println!("Serveur mTLS + HTTP2 démarré sur https://{}:8443", addr.ip());   
+    
+    let server = axum_server::bind_rustls(addr, tls_config)
+        .serve(app.into_make_service());
 
+    tokio::spawn(async {
+        if let Err(e) = ensure_minio_server_webhook().await {
+            eprintln!("Erreur lors de la configuration du webhook MinIO : {:?}", e);
+        }
+    });
+
+    server.await.context("TLS server error")?;
+    
     Ok(())
 }
 
@@ -207,11 +248,14 @@ pub async fn create_bucket(client: &Client, bucket: &str) -> Result<()> {
 async fn upload_file(client: &Client, bucket: &str, key: &str, data: &[u8]) -> Result<()> {
     create_bucket(client, bucket).await?;
     let body = ByteStream::from(data.to_vec());
+
     client
         .put_object()
         .bucket(bucket)
         .key(key)
         .body(body)
+        .metadata("rustykey-source", "internal")
+        .metadata("rustykey-upload-time", &chrono::Utc::now().to_rfc3339())
         .send()
         .await
         .with_context(|| format!("put_object {}", key))?;
@@ -220,19 +264,38 @@ async fn upload_file(client: &Client, bucket: &str, key: &str, data: &[u8]) -> R
     Ok(())
 }
 
-pub async fn download_file<P: AsRef<Path>>(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-    dest: P,
-) -> Result<()> {
+async fn download_file(
+    client: &Client, 
+    bucket: &str, 
+    key: &str
+) -> anyhow::Result<Option<Vec<u8>>> {
+    // D'abord, on récupère les métadonnées de l'objet
+    let head_resp = client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .context("Err lecture métadonnées S3")?;
+
+    // On vérifie si c'est un upload interne
+    if let Some(metadata) = head_resp.metadata() {
+        if let Some(source) = metadata.get("rustykey-source") {
+            if source == "internal" {
+                println!("🚫 Fichier {} ignoré (upload interne)", key);
+                return Ok(None); // On ne télécharge pas
+            }
+        }
+    }
+
+    // Si ce n'est pas un upload interne, on télécharge
     let resp = client
         .get_object()
         .bucket(bucket)
         .key(key)
         .send()
         .await
-        .with_context(|| format!("get_object {}", key))?;
+        .context("Err lecture fichier S3")?;
 
     let bytes = resp
         .body
@@ -240,8 +303,183 @@ pub async fn download_file<P: AsRef<Path>>(
         .await
         .context("Err lecture fichier")?;
 
-    tokio::fs::write(&dest, bytes.into_bytes())
+    Ok(Some(bytes.into_bytes().to_vec()))
+}
+
+// Handler minimal pour webhook
+async fn webhook_handler(
+    State((sender, s3_client)): State<(mpsc::UnboundedSender<SimpleEvent>, Client)>,
+    Json(data): Json<Value>,
+) -> Json<Value> {
+        
+    // Parse super basique du JSON MinIO
+    if let Some(records) = data.get("Records").and_then(|r| r.as_array()) {
+        for record in records {
+            let event_name = record.get("eventName").and_then(|e| e.as_str()).unwrap_or("unknown");
+
+            let bucket_name = record
+                .get("s3")
+                .and_then(|s3| s3.get("bucket"))
+                .and_then(|bucket| bucket.get("name"))
+                .and_then(|name| name.as_str())
+                .unwrap_or("unknown");
+            let device_id = bucket_name
+                .strip_prefix("rustykey-")
+                .unwrap_or("unknown")
+                .to_string();
+            let file_name_encoded = record
+                .get("s3")
+                .and_then(|s3| s3.get("object"))
+                .and_then(|obj| obj.get("key"))
+                .and_then(|key| key.as_str())
+                .unwrap_or("unknown");
+            
+            let file_name = decode_file_name(file_name_encoded);
+            println!("🔔 {} - {}", event_name, file_name);
+            
+            // Télécharge le fichier depuis S3 si c'est un ajout
+            let file_data = if event_name.contains("Created") {
+                match download_file(&s3_client, bucket_name, &file_name).await {
+                    Ok(Some(data)) => {
+                        println!("📥 Fichier externe téléchargé: {} bytes", data.len());
+                        data
+                    },
+                    Ok(None) => {
+                        println!("⏭️  Fichier interne ignoré: {}", file_name);
+                        continue; // On passe au suivant sans créer d'événement
+                    },
+                    Err(e) => {
+                        println!("❌ Erreur téléchargement {}: {}", file_name, e);
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            
+            let event = SimpleEvent {
+                device_id: device_id.clone(),
+                action: event_name.to_string(),
+                file_name: file_name.to_string(),
+                file_data,
+            };
+            
+            // Envoie l'événement via le channel
+            let _ = sender.send(event);
+        }
+    }
+    Json(json!({"status": "ok"}))
+}
+
+// Fonction pour traiter les événements
+async fn process_events(mut receiver: mpsc::UnboundedReceiver<SimpleEvent>) {
+    while let Some(event) = receiver.recv().await {
+        println!("⚡ Traitement: {} -> {} ({} bytes)", 
+            event.device_id, event.file_name, event.file_data.len());
+        
+        // Tes traitements ici...
+        if event.action.contains("Created") {
+            println!("  ✅ Fichier ajouté avec {} bytes de données", event.file_data.len());
+            // Ici tu peux utiliser event.file_data pour envoyer à l'agent
+        } else if event.action.contains("Removed") {
+            println!("  🗑️ Fichier supprimé");
+        }
+    }
+}
+
+// Active les événements webhook pour un bucket (pour recevoir les données d'un bucket)
+pub async fn config_webhook(client: &Client, bucket: &str) -> Result<()> {
+    //  On crée une ARN minio pour le webhook rustykey.
+    let queue_arn = format!("arn:minio:sqs::rustykey:webhook");
+
+    // On déclare les événements qui nous intéressent sur ce bucket
+    let qcfg = QueueConfiguration::builder()
+        .queue_arn(queue_arn)
+        .events(Event::S3ObjectCreatedPut)
+        .events(Event::S3ObjectRemovedDelete)
+        .build()
+        .map_err(|e| anyhow::anyhow!("Erreur création QueueConfiguration: {}", e))?;
+
+    // Configure la notification pour le bucket
+    let notif = NotificationConfiguration::builder()
+        .queue_configurations(qcfg)
+        .build();
+
+    // On l'applique au bucket
+    client
+        .put_bucket_notification_configuration()
+        .bucket(bucket)
+        .notification_configuration(notif)
+        .send()
         .await
-        .with_context(|| format!("write {:?}", dest.as_ref()))?;
+        .with_context(|| format!("Configurer webhook pour bucket {bucket}"))?;
+
+    println!("🔔 Webhook activé sur {bucket}");
     Ok(())
+}
+
+// Installe la cible webhook notify_webhook:rustykey côté MinIO puis redémarre
+pub async fn ensure_minio_server_webhook() -> anyhow::Result<()> {
+
+    let endpoint = "https://rustykey-backend.local:8443/webhook";
+    let client_cert_path = "/root/.minio/certs/webhook-client.crt";
+    let client_key_path = "/root/.minio/certs/webhook-client.key";
+    // On définit l'alias MinIO
+    let status = Command::new("mc")
+        .args(["alias", "set", "rustykey", "http://127.0.0.1:9000", "admin", "password"])
+        .status()
+        .await?;
+    if !status.success() {
+        anyhow::bail!("mc alias set a échoué");
+    }
+
+    // On vérifie si la section notify_webhook:rustykey contient déjà le bon endpoint
+    let output = Command::new("mc")
+        .args(["admin", "config", "get", "rustykey", "notify_webhook:rustykey"])
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!("mc admin config get a échoué: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let cfg = String::from_utf8_lossy(&output.stdout);
+
+    let already_ok = cfg.contains(endpoint);
+
+    if !already_ok {
+        // On configure les webhook pour l'endpoint (avec certificats pour TLS)
+        let status = Command::new("mc")
+            .args([
+                "admin", "config", "set", "rustykey", "notify_webhook:rustykey",
+                &format!("endpoint={}", endpoint),
+                &format!("client_cert={}", client_cert_path),
+                &format!("client_key={}", client_key_path),
+                "queue_limit=0",
+                "enable=on"
+            ])
+            .status()
+            .await?;
+        if !status.success() {
+            anyhow::bail!("mc admin config set a échoué");
+        }
+
+        // On redémarre le service MinIO pour appliquer la config
+        let status = Command::new("mc")
+            .args(["admin", "service", "restart", "rustykey"])
+            .status()
+            .await?;
+        if !status.success() {
+            anyhow::bail!("mc admin service restart a échoué");
+        }
+        println!("La configuration des webhooks a été appliquée pour {}", endpoint);
+    } else {
+        println!("Webhooks déjà configurés.");
+    }
+
+    Ok(())
+}
+
+fn decode_file_name(encoded_name: &str) -> String {
+    decode(encoded_name)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|_| encoded_name.to_string())
 }
