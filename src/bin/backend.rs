@@ -381,7 +381,7 @@ async fn process_events(mut receiver: mpsc::UnboundedReceiver<SimpleEvent>) {
     }
 }
 
-// Active les événements webhook pour un bucket (pour recevoir les données d'un bucket)
+// Active les événements webhook pour le bucket (pour recevoir les données du bucket)
 pub async fn config_webhook(client: &Client, bucket: &str) -> Result<()> {
     //  On crée une ARN minio pour le webhook rustykey.
     let queue_arn = format!("arn:minio:sqs::rustykey:webhook");
