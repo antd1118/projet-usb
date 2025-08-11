@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"  # S3 API
+      - "9001:9001"  # Console
+    extra_hosts:
+      # permet au conteneur de joindre ton backend sur l'hôte via ce nom
+      - "rustykey-backend.local:host-gateway"
+    environment:
+      MINIO_ROOT_USER: "admin"
+      MINIO_ROOT_PASSWORD: "password"
+
+      # === Déclare la cible webhook "rustykey" au démarrage ===
+      MINIO_NOTIFY_WEBHOOK_ENABLE_rustykey: "on"
+      MINIO_NOTIFY_WEBHOOK_ENDPOINT_rustykey: "https://rustykey-backend.local:8443/webhook"
+      # mTLS client → backend (chemins vus depuis le conteneur)
+      MINIO_NOTIFY_WEBHOOK_CLIENT_CERT_rustykey: "/root/.minio/certs/webhook.crt"
+      MINIO_NOTIFY_WEBHOOK_CLIENT_KEY_rustykey:  "/root/.minio/certs/webhook.key"
+      MINIO_NOTIFY_WEBHOOK_QUEUE_LIMIT_rustykey: "0"
+
+      # (optionnel) si tu préfères un token HTTP côté backend plutôt que mTLS client
+      # MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_rustykey: "TonJeton"
+
+      # (optionnel) n’ACK le PUT côté S3 qu’une fois le webhook acké (utile pour démo)
+      # MINIO_API_SYNC_EVENTS: "on"
+
+    volumes:
+      - ./minio-data:/data
+      - ./minio-certs:/root/.minio/certs:ro
+    restart: unless-stopped
+
+volumes:
+  minio_data:
+    driver: local

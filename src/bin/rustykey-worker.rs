@@ -48,7 +48,7 @@ fn run_worker() -> Result<()> {
                 drop_cap()?;
                 let files = build_manifest(&mount_path).await?;
                 let client = build_mtls_client()?;
-                send_manifest("https://127.0.0.1:8443/upload", &device_id, files, &client).await?;
+                send_manifest("https://rustykey-backend.local:8443/upload", &device_id, files, &client).await?;
                 Ok::<(), anyhow::Error>(())
             })?;
         }

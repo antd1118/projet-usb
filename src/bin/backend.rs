@@ -126,12 +126,6 @@ async fn main() -> anyhow::Result<()> {
     let server = axum_server::bind_rustls(addr, tls_config)
         .serve(app.into_make_service());
 
-    tokio::spawn(async {
-        if let Err(e) = ensure_minio_server_webhook().await {
-            eprintln!("Erreur lors de la configuration du webhook MinIO : {:?}", e);
-        }
-    });
-
     server.await.context("TLS server error")?;
     
     Ok(())
@@ -311,7 +305,7 @@ async fn webhook_handler(
     State((sender, s3_client)): State<(mpsc::UnboundedSender<SimpleEvent>, Client)>,
     Json(data): Json<Value>,
 ) -> Json<Value> {
-        
+    
     // Parse super basique du JSON MinIO
     if let Some(records) = data.get("Records").and_then(|r| r.as_array()) {
         for record in records {
@@ -396,6 +390,7 @@ pub async fn config_webhook(client: &Client, bucket: &str) -> Result<()> {
     let qcfg = QueueConfiguration::builder()
         .queue_arn(queue_arn)
         .events(Event::S3ObjectCreatedPut)
+        .events(Event::S3ObjectCreatedCompleteMultipartUpload)
         .events(Event::S3ObjectRemovedDelete)
         .build()
         .map_err(|e| anyhow::anyhow!("Erreur création QueueConfiguration: {}", e))?;
@@ -415,66 +410,6 @@ pub async fn config_webhook(client: &Client, bucket: &str) -> Result<()> {
         .with_context(|| format!("Configurer webhook pour bucket {bucket}"))?;
 
     println!("🔔 Webhook activé sur {bucket}");
-    Ok(())
-}
-
-// Installe la cible webhook notify_webhook:rustykey côté MinIO puis redémarre
-pub async fn ensure_minio_server_webhook() -> anyhow::Result<()> {
-
-    let endpoint = "https://rustykey-backend.local:8443/webhook";
-    let client_cert_path = "/root/.minio/certs/webhook-client.crt";
-    let client_key_path = "/root/.minio/certs/webhook-client.key";
-    // On définit l'alias MinIO
-    let status = Command::new("mc")
-        .args(["alias", "set", "rustykey", "http://127.0.0.1:9000", "admin", "password"])
-        .status()
-        .await?;
-    if !status.success() {
-        anyhow::bail!("mc alias set a échoué");
-    }
-
-    // On vérifie si la section notify_webhook:rustykey contient déjà le bon endpoint
-    let output = Command::new("mc")
-        .args(["admin", "config", "get", "rustykey", "notify_webhook:rustykey"])
-        .output()
-        .await?;
-    if !output.status.success() {
-        anyhow::bail!("mc admin config get a échoué: {}", String::from_utf8_lossy(&output.stderr));
-    }
-    let cfg = String::from_utf8_lossy(&output.stdout);
-
-    let already_ok = cfg.contains(endpoint);
-
-    if !already_ok {
-        // On configure les webhook pour l'endpoint (avec certificats pour TLS)
-        let status = Command::new("mc")
-            .args([
-                "admin", "config", "set", "rustykey", "notify_webhook:rustykey",
-                &format!("endpoint={}", endpoint),
-                &format!("client_cert={}", client_cert_path),
-                &format!("client_key={}", client_key_path),
-                "queue_limit=0",
-                "enable=on"
-            ])
-            .status()
-            .await?;
-        if !status.success() {
-            anyhow::bail!("mc admin config set a échoué");
-        }
-
-        // On redémarre le service MinIO pour appliquer la config
-        let status = Command::new("mc")
-            .args(["admin", "service", "restart", "rustykey"])
-            .status()
-            .await?;
-        if !status.success() {
-            anyhow::bail!("mc admin service restart a échoué");
-        }
-        println!("La configuration des webhooks a été appliquée pour {}", endpoint);
-    } else {
-        println!("Webhooks déjà configurés.");
-    }
-
     Ok(())
 }
 
