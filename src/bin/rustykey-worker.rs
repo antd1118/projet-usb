@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use caps::{CapSet, clear};
-use libc::{prctl, PR_SET_NO_NEW_PRIVS};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sched::{unshare, CloneFlags};
 use nix::unistd::{chdir, fork, ForkResult, pivot_root};
@@ -33,7 +32,7 @@ fn run_worker() -> Result<()> {
 
     create_namespace()?;
     
-    // On crée un second fork aprés création du namespace pour que le processus devienne PID 1 dedans
+    // On crée un second fork aprés création du namespace PID pour que le processus devienne PID 1 dedans
     match unsafe { fork()? } {
         ForkResult::Parent { .. } => {
             std::process::exit(0);
@@ -171,12 +170,6 @@ fn drop_cap() -> Result<()> {
         if let Err(e) = clear(None, set) {
             eprintln!("Erreur clear cap {:?} : {}", set, e);
         }
-    }
-
-    // On empêche l'acquisition de nouveaux privilèges 
-    let ret = unsafe { prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
-    if ret != 0 {
-        return Err(anyhow::anyhow!("Erreur PR_SET_NO_NEW_PRIVS: {}", std::io::Error::last_os_error()));
     }
     
     Ok(())

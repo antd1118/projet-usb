@@ -1,4 +1,4 @@
-use tokio_udev::{AsyncMonitorSocket, MonitorBuilder, Enumerator};
+use tokio_udev::{AsyncMonitorSocket, MonitorBuilder, Enumerator, EventType};
 use tokio_stream::StreamExt;
 use tokio::process::Command;
 use std::path::PathBuf;
@@ -7,9 +7,12 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufRead};
 use std::process::Stdio;
 use std::ffi::OsStr;
+use caps::{CapSet, clear};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // On drop les capabilités pour le processus principal
+    drop_cap()?;
 
     // Gerons le cas ou il y a déjà un périphérique branché et monté au démarrage de l'agent
 
@@ -57,7 +60,7 @@ fn handle_event(event: tokio_udev::Event) -> anyhow::Result<()> {
 
     // On gère les événements d'insertion et de retrait du périphérique
     match event.event_type() {
-        tokio_udev::EventType::Add => {
+        EventType::Add => {
             // On vérifie que c'est bien un périphérique USB avec partition
             let is_usb = event.parent_with_subsystem_devtype("usb", "usb_device")?.is_some();
             let is_partition = event.device().devtype()
@@ -94,7 +97,7 @@ fn handle_event(event: tokio_udev::Event) -> anyhow::Result<()> {
                     }
                 }
             }
-        tokio_udev::EventType::Remove => {
+        EventType::Remove => {
             let is_usb = event.parent_with_subsystem_devtype("usb", "usb_device")?.is_some();
             let is_partition = event.device().devtype()
                 .as_deref()
@@ -112,6 +115,18 @@ fn handle_event(event: tokio_udev::Event) -> anyhow::Result<()> {
         _ => {}
     }
 
+    Ok(())
+}
+
+fn drop_cap() -> anyhow::Result<()> {
+
+    // On supprime les capabilité mais on garde Ambiant pour transmission au worker
+    for set in [CapSet::Effective, CapSet::Permitted, CapSet::Inheritable] {
+        if let Err(e) = clear(None, set) {
+            eprintln!("Erreur clear cap {:?} : {}", set, e);
+        }
+    }
+    
     Ok(())
 }
 
