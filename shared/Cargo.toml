@@ -1,0 +1,14 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rustls = { workspace = true}
+rustls-pemfile = { workspace = true }
+anyhow = { workspace = true }
+
+axum-server = { workspace = true }

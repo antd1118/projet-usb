@@ -1,0 +1,30 @@
+[package]
+name = "rustykey-agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shared = { path = "../shared" }
+
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures-util = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+anyhow = { workspace = true }
+
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-tungstenite = { workspace = true }
+url = "2.5"
+
+nix = { workspace = true }
+caps = { workspace = true }
+tokio-udev = { workspace = true }
+
+walkdir = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }

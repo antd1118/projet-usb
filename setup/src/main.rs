@@ -33,11 +33,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let udevadm_found = Command::new("which")
-    .arg("udevadm")
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .status()?
-    .success();
+        .arg("udevadm")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?
+        .success();
 
     if !udevadm_found {
         return Err("⛔ udevadm n'est pas présent sur ce système. RustyKey nécessite udev.".into());
@@ -77,7 +77,7 @@ fn create_user() -> Result<(), Box<dyn std::error::Error>> {
 
         let line = String::from_utf8_lossy(&output.stdout);
         let fields: Vec<&str> = line.split(':').collect();
-        //on récupère les champs correspondants aux configurations requises
+        // On récupère les champs correspondants aux configurations requises
         if fields.len() < 7 {
             println!("🚨 L'entrée de l'utilisateur usb-agent est corrompue ou incomplète ({} champ(s))", fields.len());
             requires_recreate = true;
@@ -118,7 +118,7 @@ fn create_user() -> Result<(), Box<dyn std::error::Error>> {
     }
 
 
-    //A ce stade, l'utilisateur n'existe pas ou vient d'être supprimé, on le crée
+    // A ce stade, l'utilisateur n'existe pas ou vient d'être supprimé, on le crée
     println!("👤 Création de l'utilisateur usb-agent...");
 
     let create = Command::new("useradd")

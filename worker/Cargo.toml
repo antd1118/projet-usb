@@ -1,0 +1,19 @@
+[package]
+name = "rustykey-worker"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rustykey-worker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+nix = { workspace = true, features = ["mount", "sched", "user", "fs"] }
+caps = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+shared = { path = "../shared" }
