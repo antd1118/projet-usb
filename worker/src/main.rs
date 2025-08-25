@@ -1,4 +1,3 @@
-// Worker pour monter le device
 use std::path::PathBuf;
 use std::fs::{create_dir_all, remove_dir_all};
 use std::process::Command;
@@ -8,7 +7,7 @@ use nix::unistd::{chdir, pivot_root, fork, ForkResult};
 use caps::{CapSet, clear};
 use anyhow::{Context, Result};
 use clap::Parser;
-use shared::{WorkerRequest, WorkerResponse, IPCRequest, IPCResponse, FileEntry};
+use shared::{WorkerRequest, WorkerResponse, FileRequest, FileResponse, FileEntry};
 use tokio::io::{AsyncBufReadExt, BufReader, AsyncWriteExt};
 use serde_json;
 
@@ -30,7 +29,7 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     
-    // On convertit en notre struct
+    // On convertit en notre enum
     let request: WorkerRequest = serde_json::from_str(&args.request)
         .context("Erreur parsing requête JSON")?;
 
@@ -119,7 +118,7 @@ async fn listen_file_requests(mount_info: MountInfo) -> Result<()> {
                 }
                 
                 // On convertit la ligne JSON en requête
-                match serde_json::from_str::<IPCRequest>(line) {
+                match serde_json::from_str::<FileRequest>(line) {
                     Ok(request) => {
 
                         // Traitement
@@ -133,15 +132,15 @@ async fn listen_file_requests(mount_info: MountInfo) -> Result<()> {
                             }
                             Err(_) => {
                                 // Erreur de sérialisation
-                                let error_response = IPCResponse::Error {
-                                    message: "Erreur au traitement de la requête".to_string()
+                                let error_response = FileResponse::Error {
+                                    message: "La requête JSON est invalide".to_string()
                                 };
                                 println!("{}", serde_json::to_string(&error_response).unwrap_or_default());
                             }
                         }
                     }
                     Err(_) => {
-                        let error_response = IPCResponse::Error {
+                        let error_response = FileResponse::Error {
                             message: "La requête JSON est invalide".to_string()
                         };
                         println!("{}", serde_json::to_string(&error_response).unwrap_or_default());
@@ -156,18 +155,18 @@ async fn listen_file_requests(mount_info: MountInfo) -> Result<()> {
 }
 
 // Traite les requetes S3
-async fn handle_file_request(request: IPCRequest, mount_info: &MountInfo) -> IPCResponse {
+async fn handle_file_request(request: FileRequest, mount_info: &MountInfo) -> FileResponse {
     match request {
-        IPCRequest::ListFiles { path } => list_files_in_directory(&mount_info.mount_path, &path).await,
-        IPCRequest::ReadFile { path } => read_file_content(&mount_info.mount_path, &path).await,
-        IPCRequest::WriteFile { path, data } => write_file_content(&mount_info.mount_path, &path, data).await,
-        IPCRequest::DeleteFile { path } => delete_file_or_directory(&mount_info.mount_path, &path).await,
-        IPCRequest::CreateDirectory { path } => create_directory(&mount_info.mount_path, &path).await,
-        IPCRequest::GetMetadata { path } => get_file_info(&mount_info.mount_path, &path).await,
+        FileRequest::ListFiles { path } => list_files_in_directory(&mount_info.mount_path, &path).await,
+        FileRequest::ReadFile { path } => read_file_content(&mount_info.mount_path, &path).await,
+        FileRequest::WriteFile { path, data } => write_file_content(&mount_info.mount_path, &path, data).await,
+        FileRequest::DeleteFile { path } => delete_file_or_directory(&mount_info.mount_path, &path).await,
+        FileRequest::CreateDirectory { path } => create_directory(&mount_info.mount_path, &path).await,
+        FileRequest::GetMetadata { path } => get_file_info(&mount_info.mount_path, &path).await,
     }
 }
 
-async fn list_files_in_directory(mount_path: &PathBuf, relative_path: &str) -> IPCResponse {
+async fn list_files_in_directory(mount_path: &PathBuf, relative_path: &str) -> FileResponse {
     // On construit le chemin du dossier que l'on veut lister
     let full_path = if relative_path.is_empty() {
         mount_path.clone() // racine
@@ -215,35 +214,35 @@ async fn list_files_in_directory(mount_path: &PathBuf, relative_path: &str) -> I
             all_entries.extend(files);
                         
             // Met dans la struct de réponse
-            IPCResponse::FileList { files: all_entries }
+            FileResponse::FileList { files: all_entries }
         }
         Err(e) => {
             eprintln!("❌ Erreur lecture dossier {}: {}", full_path.display(), e);
-            IPCResponse::Error { 
+            FileResponse::Error { 
                 message: format!("Impossible de lister les fichiers: {}", e) 
             }
         }
     }
 }
 
-async fn read_file_content(mount_path: &PathBuf, relative_path: &str) -> IPCResponse {
+async fn read_file_content(mount_path: &PathBuf, relative_path: &str) -> FileResponse {
     let full_path = mount_path.join(relative_path.trim_start_matches('/'));
     
     match tokio::fs::read(&full_path).await {
-        Ok(data) => IPCResponse::FileData { data },
-        Err(e) => IPCResponse::Error { 
+        Ok(data) => FileResponse::FileData { data },
+        Err(e) => FileResponse::Error { 
             message: format!("Impossible de lire le fichier: {}", e) 
         }
     }
 }
 
-async fn write_file_content(mount_path: &PathBuf, relative_path: &str, data: Vec<u8>) -> IPCResponse {
+async fn write_file_content(mount_path: &PathBuf, relative_path: &str, data: Vec<u8>) -> FileResponse {
     let full_path = mount_path.join(relative_path.trim_start_matches('/'));
     
     // On vérifie si il manque pas des dossiers parents qui ont été créés par l'utilisateur
     if let Some(parent) = full_path.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return IPCResponse::Error { 
+            return FileResponse::Error { 
                 message: format!("Impossible de créer les dossiers parents: {}", e) 
             };
         }
@@ -251,18 +250,18 @@ async fn write_file_content(mount_path: &PathBuf, relative_path: &str, data: Vec
     
     match tokio::fs::write(&full_path, data).await {
         Ok(_) => {
-            IPCResponse::Success
+            FileResponse::Success
         }
         Err(e) => {
             eprintln!("❌ Erreur écriture fichier {}: {}", full_path.display(), e);
-            IPCResponse::Error { 
+            FileResponse::Error { 
                 message: format!("Impossible d'écrire le fichier: {}", e) 
             }
         }
     }
 }
 
-async fn delete_file_or_directory(mount_path: &PathBuf, relative_path: &str) -> IPCResponse {
+async fn delete_file_or_directory(mount_path: &PathBuf, relative_path: &str) -> FileResponse {
     let full_path = mount_path.join(relative_path.trim_start_matches('/'));
     
     // On vérifie d'abord si il existe
@@ -276,32 +275,32 @@ async fn delete_file_or_directory(mount_path: &PathBuf, relative_path: &str) -> 
             };
             
             match result {
-                Ok(_) => IPCResponse::Success,
-                Err(e) => IPCResponse::Error { 
+                Ok(_) => FileResponse::Success,
+                Err(e) => FileResponse::Error { 
                     message: format!("Impossible de supprimer: {}", e) 
                 }
             }
         }
         Err(e) => {
-            IPCResponse::Error { 
+            FileResponse::Error { 
                 message: format!("Fichier non trouvé: {}", e) 
             }
         }
     }
 }
 
-async fn create_directory(mount_path: &PathBuf, relative_path: &str) -> IPCResponse {
+async fn create_directory(mount_path: &PathBuf, relative_path: &str) -> FileResponse {
     let full_path = mount_path.join(relative_path.trim_start_matches('/'));
     
     match tokio::fs::create_dir_all(&full_path).await {
-        Ok(_) => IPCResponse::Success,
-        Err(e) => IPCResponse::Error { 
+        Ok(_) => FileResponse::Success,
+        Err(e) => FileResponse::Error { 
             message: format!("Impossible de créer le dossier: {}", e) 
         }
     }
 }
 
-async fn get_file_info(mount_path: &PathBuf, relative_path: &str) -> IPCResponse {
+async fn get_file_info(mount_path: &PathBuf, relative_path: &str) -> FileResponse {
     let full_path = mount_path.join(relative_path.trim_start_matches('/'));
     
     match tokio::fs::metadata(&full_path).await {
@@ -316,10 +315,10 @@ async fn get_file_info(mount_path: &PathBuf, relative_path: &str) -> IPCResponse
                     .map(|dt| dt.to_rfc3339()),
                 etag: String::new(), 
             };
-            IPCResponse::Metadata { entry }
+            FileResponse::Metadata { entry }
         }
         Err(e) => {
-            IPCResponse::Error { 
+            FileResponse::Error { 
                 message: format!("Impossible d'obtenir les infos du fichier: {}", e) 
             }
         }

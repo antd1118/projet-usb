@@ -5,7 +5,7 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use anyhow::Result;
 
-use crate::mount::UsbDevice;
+use crate::device_manager::UsbDevice;
 use shared::AgentNotification;
 
 /// Fonction pour écouter les événements USB
@@ -88,8 +88,8 @@ async fn handle_event(
 
                     // On l'envoie au cannal pour montage
                     if let Err(e) = device_tx.send(usb_device) {
-                        eprintln!("❌ Erreur envoi device au worker: {}", e);
-                        return Err(anyhow::anyhow!("Erreur envoi device au worker"));
+                        eprintln!("❌ Erreur envoi device: {}", e);
+                        return Err(anyhow::anyhow!("❌ Erreur envoi device"));
                     }
                 }
             }

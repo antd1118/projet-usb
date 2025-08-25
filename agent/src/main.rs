@@ -2,11 +2,10 @@ use anyhow::Result;
 use caps::{CapSet, clear};
 
 mod udev_monitor;
-mod mount;
+mod device_manager;
 mod websocket;
-mod filesystem;
 
-use websocket::RustyKeyAgent;
+use websocket::RustykeyAgent;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -16,7 +15,7 @@ async fn main() -> Result<()> {
     drop_cap()?;
 
     // Démarre l'agent
-    let mut agent = RustyKeyAgent::new().await?;
+    let mut agent = RustykeyAgent::new().await?;
     agent.run().await?;
 
     Ok(())

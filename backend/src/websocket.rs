@@ -3,10 +3,10 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use shared::{WebSocketMessage, BackendRequest, AgentNotification};
-use crate::expose_s3::RustyKeyS3Service;
+use shared::{WebSocketMessage, FileRequest, AgentNotification};
+use crate::expose_s3::RustykeyS3Service;
 
-pub async fn handle_agent_connection(socket: WebSocket, s3_service: RustyKeyS3Service) {
+pub async fn handle_agent_connection(socket: WebSocket, s3_service: RustykeyS3Service) {
     println!("📱 Nouvelle connexion agent WebSocket");
     
     let (mut ws_sender, mut ws_receiver) = socket.split();
@@ -100,8 +100,8 @@ pub async fn handle_agent_connection(socket: WebSocket, s3_service: RustyKeyS3Se
 // Pour convertir les requêtes en messages WebSocket
 fn create_request_sender(
     outbound_tx: mpsc::UnboundedSender<Message>
-) -> mpsc::UnboundedSender<(Uuid, BackendRequest)> {
-    let (request_tx, mut request_rx) = mpsc::unbounded_channel::<(Uuid, BackendRequest)>();
+) -> mpsc::UnboundedSender<(Uuid, FileRequest)> {
+    let (request_tx, mut request_rx) = mpsc::unbounded_channel::<(Uuid, FileRequest)>();
     
     tokio::spawn(async move {
         while let Some((request_id, request)) = request_rx.recv().await {

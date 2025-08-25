@@ -2,22 +2,16 @@ use axum::{extract::ws::WebSocketUpgrade, response::Response, routing::get, Rout
 use tower::make::Shared;
 mod expose_s3;
 mod websocket;
-use expose_s3::RustyKeyS3Service;
+mod audit;
+use expose_s3::RustykeyS3Service;
 use shared::{build_server_mtls_config, build_server_tls_config};
-
-
-async fn websocket_handler(ws: WebSocketUpgrade, Extension(s3_service): Extension<RustyKeyS3Service>) -> Response {
-    println!("🔌 Nouvelle connexion WebSocket d'un agent");
-    // On upgrade la connexion HTTP en WebSocket
-    ws.on_upgrade(|socket| websocket::handle_agent_connection(socket, s3_service))
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     println!("🚀 Démarrage du backend RustyKey...");
 
     // Préparation
-    let s3_service = RustyKeyS3Service::new();
+    let s3_service = RustykeyS3Service::new();
 
     // mTLS pour communication agent<=>backend
     let mtls_config = build_server_mtls_config(
@@ -25,14 +19,12 @@ async fn main() -> anyhow::Result<()> {
         "backend/backend.key",
         "backend/ca.crt",
     )?;
-    println!("🔐 Configuration websocket mTLS chargée");
 
     // TLS pour communication utilisateur<=>backend
     let tls_server_config = build_server_tls_config(
         "backend/backend.crt",
         "backend/backend.key",
     )?;
-    println!("🔓 Configuration TLS (S3 API) chargée");
 
     let websocket_router = Router::new()
         .route("/agent/ws", get(websocket_handler))
@@ -84,4 +76,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn websocket_handler(ws: WebSocketUpgrade, Extension(s3_service): Extension<RustykeyS3Service>) -> Response {
+    // On upgrade la connexion HTTP en WebSocket
+    ws.on_upgrade(|socket| websocket::handle_agent_connection(socket, s3_service))
 }

@@ -11,23 +11,24 @@ use std::hash::{Hasher, DefaultHasher};
 use tokio::sync::{RwLock, mpsc, oneshot};
 use std::sync::Arc;
 use uuid::Uuid;
-use shared::{AgentResponse, BackendRequest};
+use shared::{FileResponse, FileRequest};
 use chrono::{DateTime, Utc};
+use crate::audit;
 
 // Service principal qui gère tous les agents connectés et leurs requêtes/réponses
 #[derive(Clone)]
-pub struct RustyKeyS3Service {
+pub struct RustykeyS3Service {
 
     // Map pour envoyer les requêtes S3 à l'agent via un cannal, pour chaque device branché
-    agents: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<(Uuid, BackendRequest)>>>>,
+    agents: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<(Uuid, FileRequest)>>>>,
     // UnboundedSender peut gérer un flux de requêtes
 
     // Map pour recevoir la réponse à la requête identifiée par uuid
-    pending_responses: Arc<RwLock<HashMap<Uuid, oneshot::Sender<AgentResponse>>>>,
+    pending_responses: Arc<RwLock<HashMap<Uuid, oneshot::Sender<FileResponse>>>>,
     // oneshot::Sender cible la réponse unique liée à la requête
 }
 
-impl RustyKeyS3Service {
+impl RustykeyS3Service {
 
     pub fn new() -> Self {
         Self {
@@ -36,7 +37,7 @@ impl RustyKeyS3Service {
         }
     }
 
-    pub async fn register_agent(&self, device_id: String, sender: mpsc::UnboundedSender<(Uuid, BackendRequest)>) {
+    pub async fn register_agent(&self, device_id: String, sender: mpsc::UnboundedSender<(Uuid, FileRequest)>) {
         let bucket_name = format!("rustykey-{}", device_id);
         println!("📱 Enregistrement agent device_id: {} -> bucket: {}", device_id, bucket_name);
         
@@ -51,7 +52,7 @@ impl RustyKeyS3Service {
     }
 
     // Traite une réponse d'agent qui sera recue dans la fonction d'apres
-    pub async fn handle_agent_response(&self, request_id: Uuid, response: AgentResponse) {
+    pub async fn handle_agent_response(&self, request_id: Uuid, response: FileResponse) {
         // On essaye de retirer le cannal correspondant à la requête
         if let Some(sender) = self.pending_responses.write().await.remove(&request_id) {
             // Si ca marche, on envoie la réponse au cannal oneshot qui attendait
@@ -62,7 +63,7 @@ impl RustyKeyS3Service {
     }
 
     // Envoie une requête à un agent et attend la réponse
-    async fn send_to_agent(&self, bucket: &str, request: BackendRequest) -> Result<AgentResponse, String> {
+    async fn send_to_agent(&self, bucket: &str, request: FileRequest) -> Result<FileResponse, String> {
         let agents = self.agents.read().await;
         
         // On vérifie que l'agent est dans la map (clé branchée)
@@ -114,7 +115,7 @@ impl RustyKeyS3Service {
 }
 
 
-async fn list_buckets(State(service): State<RustyKeyS3Service>) -> Result<Response<Body>, StatusCode> {
+async fn list_buckets(State(service): State<RustykeyS3Service>) -> Result<Response<Body>, StatusCode> {
     println!("📋 ListBuckets appelé");
     // On lit tous les agents (1 agent = 1 périphérique)
     let agents = service.agents.read().await;
@@ -158,7 +159,7 @@ async fn list_buckets(State(service): State<RustyKeyS3Service>) -> Result<Respon
 async fn list_objects(
     Path(bucket): Path<String>,
     Query(query): Query<HashMap<String, String>>,
-    State(service): State<RustyKeyS3Service>
+    State(service): State<RustykeyS3Service>
 ) -> Result<Response<Body>, StatusCode> {
 
     // On récupère le prefix (nom du dossier à lister)
@@ -169,8 +170,8 @@ async fn list_objects(
     let max_keys = 1000; // Nombre max d'objets renvoyés
 
     // On envoie la requête à l'agent pour qu'il liste le répertoire
-    match service.send_to_agent(&bucket, BackendRequest::ListFiles { path: path.clone() }).await {
-        Ok(AgentResponse::FileList { files }) => {
+    match service.send_to_agent(&bucket, FileRequest::ListFiles { path: path.clone() }).await {
+        Ok(FileResponse::FileList { files }) => {
             let mut contents = Vec::new(); // Pour stocker els XML de fichiers
             let mut common_prefixes = Vec::new(); // Pour stocker les XML de dossiers
 
@@ -220,9 +221,9 @@ async fn list_objects(
                 .body(Body::from(xml))
                 .unwrap())
         }
-        Ok(AgentResponse::Error { message }) => {
+        Ok(FileResponse::Error { message }) => {
             println!("❌ Erreur listing bucket {}: {}", bucket, message);
-            if message.contains("No device connected") {
+            if message.contains("Périphérique pas monté") {
                 Err(StatusCode::NOT_FOUND)
             } else {
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -239,23 +240,28 @@ async fn list_objects(
 // Télécharge un fichier
 async fn get_object(
     Path((bucket, key)): Path<(String, String)>,
-    State(service): State<RustyKeyS3Service>
+    State(service): State<RustykeyS3Service>
 ) -> Result<Response<Body>, StatusCode> {
     println!("📥 GetObject - bucket: {}, key: {}", bucket, key);
 
     // On demande à l'agent les métadonnées du fichier voulu (date modif etc)
     let metadata = service
-        .send_to_agent(&bucket, BackendRequest::GetMetadata { path: key.clone() })
+        .send_to_agent(&bucket, FileRequest::GetMetadata { path: key.clone() })
         .await;
 
     match metadata {
-        Ok(AgentResponse::Metadata { entry }) => {
+        Ok(FileResponse::Metadata { entry }) => {
             // On demande à l'agent de lire le fichier
             match service
-                .send_to_agent(&bucket, BackendRequest::ReadFile { path: key.clone() })
+                .send_to_agent(&bucket, FileRequest::ReadFile { path: key.clone() })
                 .await
             {
-                Ok(AgentResponse::FileData { data }) => {
+                Ok(FileResponse::FileData { data }) => {
+                    
+                    // Pour logguer
+                    let hash = md5_hash(&data);
+                    audit::log_event("session1", "user1", "GET", &format!("{}/{}", bucket, key), data.len(), &hash);
+
                     let mut response = Response::builder()
                         .status(StatusCode::OK)
                         .header("Content-Type", "application/octet-stream")
@@ -275,7 +281,7 @@ async fn get_object(
 
                     Ok(response.body(Body::from(data)).unwrap())
                 }
-                Ok(AgentResponse::Error { message }) => {
+                Ok(FileResponse::Error { message }) => {
                     println!("❌ Erreur lecture fichier {}/{}: {}", bucket, &key, message);
                     Err(StatusCode::NOT_FOUND)
                 }
@@ -285,7 +291,7 @@ async fn get_object(
                 }
             }
         }
-        Ok(AgentResponse::Error { message }) => {
+        Ok(FileResponse::Error { message }) => {
             println!("❌ Erreur métadonnées {}/{}: {}", bucket, &key, message);
             Err(StatusCode::NOT_FOUND)
         }
@@ -300,7 +306,7 @@ async fn get_object(
 // Upload un fichier en créant dossier si besoin
 async fn put_object(
     Path((bucket, key)): Path<(String, String)>,
-    State(service): State<RustyKeyS3Service>,
+    State(service): State<RustykeyS3Service>,
     body: Body,
 ) -> Result<Response<Body>, StatusCode> {
     println!("📤 PutObject - bucket: {}, key: {}", bucket, key);
@@ -317,8 +323,9 @@ async fn put_object(
     // Si key se termine par '/', on fait une création de dossier
     if key.ends_with('/') {
         let dir_path = key.trim_end_matches('/').to_string();
-        match service.send_to_agent(&bucket, BackendRequest::CreateDirectory { path: dir_path }).await {
-            Ok(AgentResponse::Success) => {
+        match service.send_to_agent(&bucket, FileRequest::CreateDirectory { path: dir_path }).await {
+            Ok(FileResponse::Success) => {
+                audit::log_event("session1", "user1", "MKDIR", &format!("{}/{}", bucket, key), 0, "-");
                 Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header("Server", "RustyKey/1.0")
@@ -326,7 +333,7 @@ async fn put_object(
                     .body(Body::empty())
                     .unwrap())
             }
-            Ok(AgentResponse::Error { message }) => {
+            Ok(FileResponse::Error { message }) => {
                 println!("❌ Erreur création dossier {}/{}: {}", bucket, &key, message);
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
@@ -337,9 +344,10 @@ async fn put_object(
         }
     } else {
         // Sinon, on crée le fichier
-        match service.send_to_agent(&bucket, BackendRequest::WriteFile { path: key.clone(), data: data.clone() }).await {
-            Ok(AgentResponse::Success) => {
+        match service.send_to_agent(&bucket, FileRequest::WriteFile { path: key.clone(), data: data.clone() }).await {
+            Ok(FileResponse::Success) => {
                 let etag = md5_hash(&data);
+                audit::log_event("session1", "user1", "PUT", &format!("{}/{}", bucket, key), data.len(), &etag);
                 Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header("Server", "RustyKey/1.0")
@@ -347,7 +355,7 @@ async fn put_object(
                     .body(Body::empty())
                     .unwrap())
             }
-            Ok(AgentResponse::Error { message }) => {
+            Ok(FileResponse::Error { message }) => {
                 println!("❌ Erreur écriture fichier {}/{}: {}", bucket, &key, message);
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
@@ -363,19 +371,21 @@ async fn put_object(
 // Supprime un fichier ou dossier
 async fn delete_object(
     Path((bucket, key)): Path<(String, String)>,
-    State(service): State<RustyKeyS3Service>,
+    State(service): State<RustykeyS3Service>,
 ) -> Result<Response<Body>, StatusCode> {
     println!("🗑️ DeleteObject - bucket: {}, key: {}", bucket, key);
     
-    match service.send_to_agent(&bucket, BackendRequest::DeleteFile { path: key.clone() }).await {
-        Ok(AgentResponse::Success) => {
+    match service.send_to_agent(&bucket, FileRequest::DeleteFile { path: key.clone() }).await {
+        Ok(FileResponse::Success) => {
+            audit::log_event("session1", "user1", "DELETE", &format!("{}/{}", bucket, key), 0, "-");
+
             Ok(Response::builder()
                 .status(StatusCode::NO_CONTENT)
                 .header("Server", "RustyKey/1.0")
                 .body(Body::empty())
                 .unwrap())
         }
-        Ok(AgentResponse::Error { message }) => {
+        Ok(FileResponse::Error { message }) => {
             println!("❌ Erreur suppression {}/{}: {}", bucket, key, message);
             // S3 retourne 204 même si l'objet n'existe pas
             if message.contains("not found") || message.contains("No such file") {
@@ -398,7 +408,7 @@ async fn delete_object(
 // Vérifie si un bucket existe
 async fn head_bucket(
     Path(bucket): Path<String>,
-    State(service): State<RustyKeyS3Service>
+    State(service): State<RustykeyS3Service>
 ) -> Result<Response<Body>, StatusCode> {
     println!("🔍 HeadBucket - bucket: {}", bucket);
     
@@ -417,15 +427,15 @@ async fn head_bucket(
 // Récupère métadonnées sans contenu
 async fn head_object(
     Path((bucket, key)): Path<(String, String)>,
-    State(service): State<RustyKeyS3Service>
+    State(service): State<RustykeyS3Service>
 ) -> Result<Response<Body>, StatusCode> {
     println!("🔍 HeadObject - bucket: {}, key: {}", bucket, key);
 
     match service
-        .send_to_agent(&bucket, BackendRequest::GetMetadata { path: key.clone() })
+        .send_to_agent(&bucket, FileRequest::GetMetadata { path: key.clone() })
         .await
     {
-        Ok(AgentResponse::Metadata { entry }) => {
+        Ok(FileResponse::Metadata { entry }) => {
             let mut response = Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Length", entry.size)
@@ -441,7 +451,7 @@ async fn head_object(
 
             Ok(response.body(Body::empty()).unwrap())
         }
-        Ok(AgentResponse::Error { .. }) => Err(StatusCode::NOT_FOUND),
+        Ok(FileResponse::Error { .. }) => Err(StatusCode::NOT_FOUND),
         _ => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }

@@ -1,15 +1,10 @@
-// shared/src/messages.rs
 use serde::{Serialize, Deserialize};
 use uuid::Uuid;
 use std::path::PathBuf;
 
-// =====================================
-// Messages Backend ↔ Agent
-// =====================================
-
-// Messages du Backend vers l'Agent
+// Pour les opérations de fichier (Backend=>Agent et Agent=>Worker)
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum BackendRequest {
+pub enum FileRequest {
     ListFiles { path: String },
     ReadFile { path: String },
     WriteFile { path: String, data: Vec<u8> },
@@ -18,9 +13,9 @@ pub enum BackendRequest {
     GetMetadata { path: String },
 }
 
-// Réponses de l'Agent vers le Backend
+// Pour les réponses (Agent=>Backend et Worker=>Agent)
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum AgentResponse {
+pub enum FileResponse {
     FileList { files: Vec<FileEntry> },
     FileData { data: Vec<u8> },
     Success,
@@ -28,19 +23,9 @@ pub enum AgentResponse {
     Metadata { entry: FileEntry },
 }
 
-// Notifications spontanées de l'Agent vers le Backend
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum AgentNotification {
-    DeviceConnected { device_id: String },
-    DeviceDisconnected { device_id: String },
-    FileChanged { path: String },
-}
 
-// =====================================
-// Messages Agent ↔ Worker 
-// =====================================
 
-// Messages de l'Agent vers le Worker
+// Messages de montage de l'Agent vers le Worker
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum WorkerRequest {
     MountDevice {
@@ -68,52 +53,39 @@ pub enum WorkerResponse {
     UnmountError { device_id: String, error: String },
 }
 
-// Messages IPC filesystem entre Agent et Worker
-#[derive(Serialize, Deserialize, Debug)]
-pub enum IPCRequest {
-    ListFiles { path: String },
-    ReadFile { path: String },
-    WriteFile { path: String, data: Vec<u8> },
-    DeleteFile { path: String },
-    CreateDirectory { path: String },
-    GetMetadata { path: String },
+
+
+// Notifications de statut du device de l'Agent vers le Backend
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum AgentNotification {
+    DeviceConnected { device_id: String },
+    DeviceDisconnected { device_id: String },
+    FileChanged { path: String },
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub enum IPCResponse {
-    FileList { files: Vec<FileEntry> },
-    FileData { data: Vec<u8> },
-    Success,
-    Error { message: String },
-    Metadata { entry: FileEntry },
-}
 
-// =====================================
-// Types communs
-// =====================================
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileEntry {
     pub path: String,
     pub size: u64,
     pub is_directory: bool,
-    pub modified: Option<String>, // ISO 8601 timestamp
-    pub etag: String, // Hash du fichier pour S3
+    pub modified: Option<String>,
+    pub etag: String, // todo
 }
 
-// Message wrapper avec structure complète pour WebSocket
 #[derive(Serialize, Deserialize, Debug)]
 pub enum WebSocketMessage {
-    // Requête avec ID de corrélation
-    Request { 
-        id: Uuid, 
-        request: BackendRequest 
+
+    Request {
+        id: Uuid,
+        request: FileRequest
     },
-    // Réponse avec ID de corrélation
-    Response { 
-        id: Uuid, 
-        response: AgentResponse 
+
+    Response {
+        id: Uuid,
+        response: FileResponse
     },
-    // Notification sans ID (spontanée)
+
     Notification(AgentNotification),
 }

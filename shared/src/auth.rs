@@ -15,7 +15,6 @@ pub fn build_server_mtls_config(
     server_key_path: &str,
     client_ca_path: &str,
 ) -> Result<RustlsConfig> {
-    println!("🔐 Configuration mTLS du serveur S3...");
     
     let cert_chain = load_certs(server_cert_path)
         .context("Erreur chargement certificat serveur")?;
@@ -53,7 +52,6 @@ pub fn build_client_mtls_config(
     client_key_path: &str,
     server_ca_path: &str,
 ) -> Result<ClientConfig> {
-    println!("🔐 Configuration mTLS client...");
     
     let cert_chain = load_certs(client_cert_path)
         .context("Erreur chargement certificat client")?;
@@ -146,7 +144,6 @@ pub fn build_server_tls_config(
     server_cert_path: &str,
     server_key_path: &str,
 ) -> Result<RustlsConfig> {
-    println!("🔓 Configuration TLS serveur standard...");
     
     let cert_chain = load_certs(server_cert_path)
         .context("Erreur chargement certificat serveur")?;

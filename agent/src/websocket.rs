@@ -5,32 +5,31 @@ use std::sync::Arc;
 use uuid::Uuid;
 use anyhow::{Result, Context};
 
-use shared::{WebSocketMessage, BackendRequest, AgentResponse, AgentNotification, build_client_mtls_config};
-use crate::mount::UsbDevice;
-use crate::filesystem::FileSystemHandler;
+use shared::{WebSocketMessage, FileRequest, FileResponse, AgentNotification, build_client_mtls_config};
+use crate::device_manager::{UsbDevice, OperationManager};
 use crate::udev_monitor;
 
-pub struct RustyKeyAgent {
-    fs_handler: Arc<RwLock<FileSystemHandler>>,
+pub struct RustykeyAgent {
+    device_manager: Arc<RwLock<OperationManager>>,
     notification_tx: mpsc::UnboundedSender<AgentNotification>,
     device_tx: mpsc::UnboundedSender<UsbDevice>,
 }
 
-impl RustyKeyAgent {
+impl RustykeyAgent {
     pub async fn new() -> Result<Self> {
         let (notification_tx, notification_rx) = mpsc::unbounded_channel();
         let (device_tx, device_rx) = mpsc::unbounded_channel();
 
-        let fs_handler = Arc::new(RwLock::new(FileSystemHandler::new()));
+        let device_manager = Arc::new(RwLock::new(OperationManager::new()));
         
         // Démarrer la connexion WebSocket
-        Self::start_websocket_connection_static(notification_rx, fs_handler.clone());
+        Self::start_websocket(notification_rx, device_manager.clone());
 
         // Démarrer le gestionnaire de devices
-        Self::start_device_handler_static(device_rx, fs_handler.clone(), notification_tx.clone());
+        Self::start_device_handler(device_rx, device_manager.clone(), notification_tx.clone());
 
         let agent = Self {
-            fs_handler,
+            device_manager,
             notification_tx,
             device_tx,
         };
@@ -49,28 +48,28 @@ impl RustyKeyAgent {
         Ok(())
     }
 
-    fn start_websocket_connection_static(
+    fn start_websocket(
         notification_rx: mpsc::UnboundedReceiver<AgentNotification>,
-        fs_handler: Arc<RwLock<FileSystemHandler>>,
+        device_manager: Arc<RwLock<OperationManager>>,
     ) {
         tokio::spawn(async move {
-            Self::websocket_task(notification_rx, fs_handler).await;
+            Self::websocket_task(notification_rx, device_manager).await;
         });
     }
 
-    fn start_device_handler_static(
+    fn start_device_handler(
         device_rx: mpsc::UnboundedReceiver<UsbDevice>,
-        fs_handler: Arc<RwLock<FileSystemHandler>>,
+        device_manager: Arc<RwLock<OperationManager>>,
         notification_tx: mpsc::UnboundedSender<AgentNotification>,
     ) {
         tokio::spawn(async move {
-            Self::device_handler_task(device_rx, fs_handler, notification_tx).await;
+            Self::device_handler(device_rx, device_manager, notification_tx).await;
         });
     }
 
     async fn websocket_task(
         notification_rx: mpsc::UnboundedReceiver<AgentNotification>,
-        fs_handler: Arc<RwLock<FileSystemHandler>>,
+        device_manager: Arc<RwLock<OperationManager>>,
     ) {
         
         let (broadcast_tx, _) = tokio::sync::broadcast::channel::<AgentNotification>(100);
@@ -80,7 +79,6 @@ impl RustyKeyAgent {
         let broadcast_tx_clone = broadcast_tx.clone();
         tokio::spawn(async move {
             while let Some(notification) = original_rx.recv().await {
-                // Redistribuer vers le broadcast (ignore si personne écoute)
                 let _ = broadcast_tx_clone.send(notification);
             }
         });
@@ -90,20 +88,17 @@ impl RustyKeyAgent {
                 Ok((mut ws_sender, mut ws_receiver)) => {
                     println!("🌐 Connecté au backend via WebSocket mTLS");
 
-                    // Channel unique pour tous les envois WebSocket
                     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Message>();
-                    
-                    // Channel pour les requêtes seulement
-                    let (request_tx, mut request_rx) = mpsc::unbounded_channel::<(Uuid, BackendRequest)>();
+                    let (request_tx, mut request_rx) = mpsc::unbounded_channel::<(Uuid, FileRequest)>();
 
                     // TASK 1 TRAITEMENT DES REQUETES BACKEND
-                    let fs_handler_clone = fs_handler.clone();
+                    let device_manager_clone = device_manager.clone();
                     let outbound_tx_clone = outbound_tx.clone();
                     let task1 = tokio::spawn(async move {
                         while let Some((request_id, request)) = request_rx.recv().await {
                             println!("🔄 Traitement requête {} : {:?}", request_id, request);
                             
-                            let response = Self::handle_backend_request(&fs_handler_clone, request).await;
+                            let response = Self::handle_backend_request(&device_manager_clone, request).await;
                             
                             let msg = WebSocketMessage::Response { id: request_id, response };
                             if let Ok(json) = serde_json::to_string(&msg) {
@@ -116,16 +111,24 @@ impl RustyKeyAgent {
                                 println!("❌ Erreur sérialisation réponse");
                             }
                         }
-                        println!("📥 Task request handler terminée");
+                        println!("🔥 Task request handler terminée");
                     });
 
-                    // TASK 2 GESTION DES NOTIFICATIONS (nouveau receiver à chaque connexion)
+                    // TASK 2 GESTION DES NOTIFICATIONS
                     let outbound_tx_clone = outbound_tx.clone();
-                    let mut local_notification_rx = broadcast_tx.subscribe(); // Nouveau receiver
+                    let device_manager_cleanup = device_manager.clone();
+                    let mut local_notification_rx = broadcast_tx.subscribe();
                     let task2 = tokio::spawn(async move {
                         while let Ok(notification) = local_notification_rx.recv().await {
                             println!("📢 Envoi notification : {:?}", notification);
                             
+                            // Si on recoit la notif de deco de udev_monitor, on ferme le worker avec remove_device
+                            if let AgentNotification::DeviceDisconnected { ref device_id } = notification {
+                                println!("🗑️ Nettoyage local device: {}", device_id);
+                                device_manager_cleanup.write().await.remove_device(device_id).await;
+                                println!("🧹 Device {} nettoyé localement", device_id);
+                            }
+
                             let msg = WebSocketMessage::Notification(notification);
                             if let Ok(json) = serde_json::to_string(&msg) {
                                 let message = Message::Text(json.into());
@@ -174,7 +177,7 @@ impl RustyKeyAgent {
                                 }
                             }
                             Ok(Message::Close(_)) => {
-                                println!("🔌 Connexion WebSocket fermée par le backend");
+                                println!("📌 Connexion WebSocket fermée par le backend");
                                 break;
                             }
                             Err(e) => {
@@ -203,14 +206,14 @@ impl RustyKeyAgent {
         }
     }
 
-    async fn device_handler_task(
+    async fn device_handler(
         mut device_rx: mpsc::UnboundedReceiver<UsbDevice>,
-        fs_handler: Arc<RwLock<FileSystemHandler>>,
+        device_manager: Arc<RwLock<OperationManager>>,
         notification_tx: mpsc::UnboundedSender<AgentNotification>,
     ) {
         while let Some(mut device) = device_rx.recv().await {
             println!("💾 Traitement du device: {}", device.device_id);
-            println!("   📍 Device path: {:?}", device.device_path);
+            println!("   📁 Device path: {:?}", device.device_path);
 
             println!("🚀 Début montage device {}...", device.device_id);
             let start_time = std::time::Instant::now();
@@ -223,15 +226,15 @@ impl RustyKeyAgent {
                     println!("   📁 Mount path: {:?}", device.mount_path);
                     println!("   💾 FS type: {}", device.filesystem_type);
                     
-                    // Ajouter à la map des devices
-                    fs_handler.write().await.add_device(device);
+                    // Ajouter au gestionnaire
+                    device_manager.write().await.add_device(device);
                     
                     // Vérifier que le device est bien ajouté
-                    let device_count = fs_handler.read().await.device_count();
+                    let device_count = device_manager.read().await.device_count();
                     println!("📊 Nombre de devices actifs: {}", device_count);
                     
                     // Lister tous les devices actifs
-                    let active_devices = fs_handler.read().await.list_active_devices();
+                    let active_devices = device_manager.read().await.list_active_devices();
                     println!("📋 Devices actifs: {:?}", active_devices);
                     
                     if let Err(e) = notification_tx.send(AgentNotification::DeviceConnected { 
@@ -246,7 +249,6 @@ impl RustyKeyAgent {
                     let duration = start_time.elapsed();
                     eprintln!("❌ Échec montage device {} en {:?}: {}", device.device_id, duration, e);
                     
-                    // Envoyer notification de déconnexion en cas d'erreur
                     if let Err(e) = notification_tx.send(AgentNotification::DeviceDisconnected { 
                         device_id: device.device_id 
                     }) {
@@ -287,18 +289,18 @@ impl RustyKeyAgent {
     }
 
     async fn handle_backend_request(
-        fs_handler: &Arc<RwLock<FileSystemHandler>>,
-        request: BackendRequest,
-    ) -> AgentResponse {
-        let mut handler = fs_handler.write().await;
+        device_manager: &Arc<RwLock<OperationManager>>,
+        request: FileRequest,
+    ) -> FileResponse {
+        let mut manager = device_manager.write().await;
         
         match request {
-            BackendRequest::ListFiles { path } => handler.list_files(&path).await,
-            BackendRequest::ReadFile { path } => handler.read_file(&path).await,
-            BackendRequest::WriteFile { path, data } => handler.write_file(&path, data).await,
-            BackendRequest::DeleteFile { path } => handler.delete_file(&path).await,
-            BackendRequest::CreateDirectory { path } => handler.create_directory(&path).await,
-            BackendRequest::GetMetadata { path } => handler.get_metadata(&path).await,
+            FileRequest::ListFiles { path } => manager.list_files(&path).await,
+            FileRequest::ReadFile { path } => manager.read_file(&path).await,
+            FileRequest::WriteFile { path, data } => manager.write_file(&path, data).await,
+            FileRequest::DeleteFile { path } => manager.delete_file(&path).await,
+            FileRequest::CreateDirectory { path } => manager.create_directory(&path).await,
+            FileRequest::GetMetadata { path } => manager.get_metadata(&path).await,
         }
     }
 }
